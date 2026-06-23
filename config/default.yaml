@@ -1,0 +1,43 @@
+futu:
+  host: 127.0.0.1
+  port: 11111
+
+universe:
+  tickers: [HK.800000, HK.03188]
+  primary: HK.03188
+
+data:
+  poll_interval_sec: 5
+  bar_interval: 1m
+  data_dir: data
+
+rules:
+  pair_spread:
+    enabled: true
+    tickers: [HK.800000, HK.03188]
+    window_sec: 60
+    poll_interval_sec: 5
+    spread_entry_pct: 0.15
+    spread_exit_pct: 0.05
+    require_same_sign: false
+    trade_ticker: HK.03188
+
+  point_breakout:
+    enabled: true
+    symbol: HK.MHImain
+    threshold_pts: 20
+    exit_threshold_pts: 10
+    trade_ticker: HK.MHImain
+
+strategy:
+  paper_trading: true
+
+risk:
+  max_daily_loss_pct: 2.0
+  max_position_shares: 1000
+  stale_poll_multiplier: 2.0
+
+backtest:
+  min_bars: 500
+  max_drawdown_pct: 15.0
+  min_trades: 1
