@@ -1,3 +1,8 @@
+# Structured logging (mhimain CLI)
+logging:
+  level: INFO       # DEBUG | INFO | WARNING | ERROR
+  format: json      # json | text (key=value lines)
+
 # Futu OpenD connection
 futu:
   host: 127.0.0.1
@@ -16,36 +21,46 @@ mhimain:
   ma_period: 10              # daily MA length for uncertain entries
 
   # P/L exits measured from launch baseline (or 0 for new entries this session)
-  cut_loss_pts: 200         # close when P/L is launch − 200 pts
-  take_profit_pts: 400      # close when P/L is launch + 400 pts
+  cut_loss_pts: 20         # close when P/L is launch − 200 pts
+  take_profit_pts: 40      # close when P/L is launch + 400 pts
+  cut_loss_min_hold_hours: 0.12  # no cut loss until position held this long (take profit still allowed)
 
-  # Re-entry block after any exit (cut loss or take profit); clears when either:
-  reentry_move_pts: 300      #   price moves 300 pts from exit, or
-  reentry_trading_hours: 3   #   6 trading hours elapse
+  # Re-entry block after any exit; clears when ALL apply:
+  reentry_minimum_hours: 0.4   #   always wait at least this long (even if price moves enough)
+  reentry_move_pts: 30      #   then price moves 300 pts from exit, or
+  reentry_trading_hours: 0.24   #   reentry_trading_hours elapse (whichever clears first after minimum)
 
   # Panic pause: block cut loss (not take profit) after a violent move
   panic_move_pts: 150
   panic_window_sec: 120
-  panic_wait_min: 20
+  panic_wait_min: 30
 
   # Paper vs live — single switch
   #   SIMULATE — routes orders to Futu sim account via OpenFutureTradeContext
-  #   REAL     — live futures account (requires unlock_trade in OpenD)
-  trd_env: REAL 
+  #   REAL     — live futures account (requires trade unlock at startup)
+  trd_env: SIMULATE
+
+  # Trade password for REAL unlock (optional — leave empty to prompt interactively).
+  # Non-interactive/systemd: set FUTU_TRADE_PASSWORD env instead of storing here.
+  trade_password:
+  trade_unlock_valid_days: 21   # flatten open position, then lock orders; prompt password to continue
 
   # Market orders only if |last_price − bid/ask| < this (points)
   max_market_slippage_pts: 4
 
   # Re-sync broker position from Futu and print snapshot every N seconds
-  position_refresh_sec: 200
+  position_refresh_sec: 2
 
 data:
   poll_interval_sec: 1      # seconds between quote polls
-  poll_display_threshold_pts: 20  # only print status when price moves this many pts
+  poll_display_threshold_pts: 40  # only print status when price moves this many pts
 
 risk:
-  # Kill switch: stop trading if session equity drops by this % from day start
-  max_daily_loss_pct: 20.0
+  # Kill switch: stop trading if account equity drops by this % from session day-start baseline
+  max_daily_loss_pct: 50.0
+  # Fallback when OpenD accinfo unavailable at startup (HKD total_assets)
+  # account_equity:
 
-  # If no fresh quote for (poll_interval_sec × this value), log stale warning
-  stale_poll_multiplier: 10.0
+  # Stale threshold = poll_interval_sec × this value (seconds)
+  # Blocks new entries when poll gap OR quote data_time age exceeds threshold
+  stale_poll_multiplier: 30.0

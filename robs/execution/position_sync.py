@@ -1,4 +1,4 @@
-"""Sync unit position and P/L baseline from Futu at startup."""
+"""Sync unit position and P/L baseline from Futu at startup and periodic refresh."""
 
 from __future__ import annotations
 
@@ -149,6 +149,7 @@ def apply_broker_position(
     if broker.contracts == 0:
         position_book.reset_after_flat()
         strategy.entry_price = None
+        strategy.position_opened_at = None
         if bootstrap:
             strategy.pnl_baseline.reset_on_new_entry()
         return
@@ -193,10 +194,36 @@ def refresh_broker_position(
     *,
     cfg: dict | None = None,
 ) -> bool:
-    """Sync position/P/L from broker without resetting cut-loss baseline. Returns True if position changed."""
+    """Periodic broker sync: position state + min-hold / cooldown on manual open/close."""
     old_pos = position_book.contracts
+    new_pos = broker.contracts
+    entry_before = strategy.entry_price
+    px = broker.current_price
+
+    sign_changed = (
+        old_pos != 0
+        and new_pos != 0
+        and ((old_pos > 0 and new_pos < 0) or (old_pos < 0 and new_pos > 0))
+    )
+
+    if old_pos != 0 and (new_pos == 0 or sign_changed):
+
+        def _handle_manual_close() -> None:
+            if entry_before is not None and px is not None:
+                sign = 1 if old_pos > 0 else -1
+                strategy.pnl_baseline.realize_on_close(entry_before, px, sign)
+            exit_px = px if px is not None else (entry_before if entry_before is not None else 0.0)
+            strategy.on_broker_position_closed(exit_px)
+
+        _handle_manual_close()
+
     apply_broker_position(broker, position_book, strategy, bootstrap=False)
     risk.position_shares = broker.contracts
-    if broker.contracts == 0 and old_pos != 0:
+
+    if new_pos != 0 and (old_pos == 0 or sign_changed):
+        strategy.on_broker_position_opened()
+
+    if new_pos == 0:
         strategy.rearm_entry_if_flat(position_book)
-    return old_pos != broker.contracts
+
+    return old_pos != new_pos

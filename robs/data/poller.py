@@ -37,9 +37,9 @@ class SnapshotPoller:
 
     def poll_once(self) -> pd.DataFrame:
         ok, data = self.quote.snapshot(self.tickers)
-        self.last_poll_at = datetime.now(timezone.utc)
         if not ok or data is None or len(data) == 0:
             return pd.DataFrame()
+        self.last_poll_at = datetime.now(timezone.utc)
         return snapshots_to_frame(data)
 
     def run(

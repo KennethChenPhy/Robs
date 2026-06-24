@@ -1,0 +1,18 @@
+[Unit]
+Description=Robs MHImain futures trader
+After=network-online.target futu-opend.service
+Wants=futu-opend.service
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=%h/Robs
+# For REAL: add FUTU_TRADE_PASSWORD to /etc/futu-opend.env or use EnvironmentFile=
+EnvironmentFile=-/etc/futu-opend.env
+ExecStart=%h/Robs/deploy/gcp/run-mhimain.sh --trend uncertain
+Restart=on-failure
+RestartSec=10
+# Logs: journalctl -u robs-mhimain -f
+
+[Install]
+WantedBy=multi-user.target

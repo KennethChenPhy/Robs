@@ -22,7 +22,7 @@ class Trader:
     def paper(self) -> bool:
         return trd_env_name(self.cfg) != "REAL"
 
-    def execute(self, signal: Signal, qty: int | None = None, *, dry_run: bool = False) -> dict[str, Any]:
+    def execute(self, signal: Signal, qty: int | None = None) -> dict[str, Any]:
         if signal.action == Action.HOLD:
             return {"status": "skipped", "reason": "HOLD"}
 
@@ -58,9 +58,8 @@ class Trader:
             qty=order_qty,
             side=side,
             trd_env=trd_env_from_config(self.cfg),
-            dry_run=dry_run,
         )
-        if result.get("dry_run") or (result.get("ok") and result.get("filled", True)):
+        if result.get("ok") and result.get("filled", True):
             self.risk.on_fill(side, order_qty)
         result["rule"] = signal.rule
         result["signal_reason"] = signal.reason

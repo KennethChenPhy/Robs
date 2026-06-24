@@ -1,0 +1,22 @@
+[Unit]
+Description=Futu OpenD gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/etc/futu-opend.env
+WorkingDirectory=/opt/futu-opend/current
+ExecStart=/bin/bash -c '/usr/local/bin/futu-opend \
+  -login_account=${FUTU_ACCOUNT} \
+  -login_pwd=${FUTU_PASSWORD} \
+  -lang=en \
+  -api_ip=${LISTEN_IP} \
+  -api_port=${LISTEN_PORT} \
+  ${OPEND_CFG_FILE:+-cfg_file=${OPEND_CFG_FILE}}'
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=multi-user.target

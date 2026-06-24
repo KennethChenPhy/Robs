@@ -61,5 +61,5 @@ def trd_env_from_config(cfg: dict[str, Any]):
 
 
 def is_paper_trading(cfg: dict[str, Any]) -> bool:
-    """Deprecated alias: means Futu SIMULATE account, not skip-the-API dry-run."""
+    """True when configured for Futu SIMULATE (paper) account."""
     return trd_env_name(cfg) != "REAL"

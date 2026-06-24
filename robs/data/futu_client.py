@@ -7,6 +7,8 @@ from typing import Any
 
 from futu import OpenQuoteContext, OpenSecTradeContext, RET_OK
 
+from robs.config import trd_env_from_config
+
 
 @dataclass
 class FutuEndpoints:
@@ -115,6 +117,21 @@ class TradeClient:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    def fetch_account_equity(self, cfg: dict[str, Any]) -> float | None:
+        """Broker total_assets for daily loss kill switch."""
+        trd_env = trd_env_from_config(cfg)
+        ret, data = self._ctx.accinfo_query(trd_env=trd_env)
+        if ret != RET_OK or data is None or len(data) == 0:
+            return None
+        total = data.iloc[0].get("total_assets")
+        if total is None or str(total).strip().upper() in ("", "N/A", "NA", "NONE"):
+            return None
+        try:
+            val = float(total)
+        except (TypeError, ValueError):
+            return None
+        return val if val > 0 else None
+
     def place_market_order(
         self,
         code: str,
@@ -122,17 +139,7 @@ class TradeClient:
         side: str,
         *,
         trd_env=None,
-        dry_run: bool = False,
     ) -> dict[str, Any]:
-        if dry_run:
-            return {
-                "dry_run": True,
-                "code": code,
-                "qty": qty,
-                "side": side,
-                "status": "skipped",
-            }
-
         from futu import OrderType, RET_OK, TrdEnv, TrdSide
 
         if trd_env is None:
@@ -149,7 +156,6 @@ class TradeClient:
         )
         ok = ret == RET_OK
         result: dict[str, Any] = {
-            "dry_run": False,
             "ok": ok,
             "code": code,
             "qty": qty,

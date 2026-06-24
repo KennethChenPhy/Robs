@@ -15,6 +15,7 @@ class RiskManager:
     position_shares: int = 0
     killed: bool = False
     kill_reason: str = ""
+    _kill_close_announced: bool = field(default=False, repr=False)
 
     @property
     def max_position(self) -> int:
@@ -29,6 +30,15 @@ class RiskManager:
             self.day_start_equity = equity
         self.current_equity = equity
         self._check_daily_loss()
+
+    def refresh_equity(self, equity: float) -> None:
+        """Update current equity from broker; day_start is set on first call only."""
+        self.set_equity(equity)
+
+    def equity_loss_pct(self) -> float:
+        if self.day_start_equity <= 0:
+            return 0.0
+        return (self.day_start_equity - self.current_equity) / self.day_start_equity * 100.0
 
     def _check_daily_loss(self) -> None:
         if self.day_start_equity <= 0:

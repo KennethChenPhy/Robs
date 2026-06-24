@@ -1,0 +1,4 @@
+futu-api>=9.0
+pyyaml>=6.0
+scipy>=1.11
+pandas>=2.0

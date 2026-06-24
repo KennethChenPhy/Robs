@@ -14,8 +14,11 @@ class PositionPnLBaseline:
     take_profit_pts: float = 400.0
     reentry_move_pts: float = 300.0
     reentry_trading_hours: float = 6.0
+    reentry_minimum_hours: float = 4.0
+    cut_loss_min_hold_hours: float = 24.0
     locked: bool = False
     cooldown_ref_price: float | None = None
+    cooldown_started_at: datetime | None = None
     cooldown_until: datetime | None = None
     baseline_pnl_pts: float = 0.0
     session_accum_pnl_pts: float = 0.0
@@ -69,6 +72,27 @@ class PositionPnLBaseline:
         pnl = self.pnl_points(entry_price, price, position)
         return pnl <= self.cut_loss_trigger()
 
+    def blocks_cut_loss_for_hold(
+        self,
+        opened_at: datetime | None,
+        now: datetime | None = None,
+    ) -> tuple[bool, str]:
+        """Block cut loss until position has been held for cut_loss_min_hold_hours."""
+        if opened_at is None:
+            return False, ""
+        now = now or datetime.now(timezone.utc)
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        elapsed_h = (now - opened_at).total_seconds() / 3600.0
+        if elapsed_h >= self.cut_loss_min_hold_hours:
+            return False, ""
+        remaining_h = self.cut_loss_min_hold_hours - elapsed_h
+        return (
+            True,
+            f"min hold: no cut loss for {remaining_h:.1f}h more "
+            f"(need {self.cut_loss_min_hold_hours:.0f}h)",
+        )
+
     def should_take_profit(self, entry_price: float, price: float, position: int) -> bool:
         if position == 0:
             return False
@@ -85,14 +109,24 @@ class PositionPnLBaseline:
     def _clear_cooldown(self) -> None:
         self.locked = False
         self.cooldown_ref_price = None
+        self.cooldown_started_at = None
         self.cooldown_until = None
 
     def record_exit_cooldown(self, exit_price: float) -> None:
-        """After cut loss or take profit: lock entries until move or trading hours elapsed."""
+        """After exit: lock entries until min hours, then move or max trading hours."""
         now = datetime.now(timezone.utc)
         self.locked = True
         self.cooldown_ref_price = exit_price
+        self.cooldown_started_at = now
         self.cooldown_until = now + timedelta(hours=self.reentry_trading_hours)
+
+    def _cooldown_hours_elapsed(self, now: datetime) -> float:
+        if self.cooldown_started_at is None:
+            return 0.0
+        started = self.cooldown_started_at
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return (now - started).total_seconds() / 3600.0
 
     def record_cut_loss(self, exit_price: float) -> None:
         self.record_exit_cooldown(exit_price)
@@ -102,11 +136,22 @@ class PositionPnLBaseline:
             return False, ""
 
         now = datetime.now(timezone.utc)
+        elapsed_h = self._cooldown_hours_elapsed(now)
+
         if self.cooldown_until is not None and now >= self.cooldown_until:
             self._clear_cooldown()
             return False, f"cooldown cleared after {self.reentry_trading_hours:.0f} trading hours"
 
         move = abs(price - self.cooldown_ref_price)
+        min_hours_left = max(0.0, self.reentry_minimum_hours - elapsed_h)
+
+        if min_hours_left > 0:
+            return (
+                True,
+                f"cooldown: {min_hours_left:.1f}h min wait before re-entry "
+                f"(move {move:.0f}/{self.reentry_move_pts:.0f}pt from {self.cooldown_ref_price:.1f})",
+            )
+
         if move >= self.reentry_move_pts:
             self._clear_cooldown()
             return False, f"cooldown cleared after {move:.0f}pt move"

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from robs.execution.cut_loss import PositionPnLBaseline
@@ -21,6 +22,7 @@ class MHImainStrategy:
     reentry_move_pts: float = 300.0
     ma_period: int = 5
     entry_price: float | None = None
+    position_opened_at: datetime | None = None
     ma5: float | None = None
     pnl_baseline: PositionPnLBaseline = field(default_factory=PositionPnLBaseline)
     panic_guard: PanicGuard = field(default_factory=PanicGuard)
@@ -42,7 +44,9 @@ class MHImainStrategy:
         cut_loss_pts = float(mhi.get("cut_loss_pts", 200))
         reentry_move_pts = float(mhi.get("reentry_move_pts", 300))
         reentry_trading_hours = float(mhi.get("reentry_trading_hours", 6))
+        reentry_minimum_hours = float(mhi.get("reentry_minimum_hours", 4))
         take_profit_pts = float(mhi.get("take_profit_pts", 400))
+        cut_loss_min_hold_hours = float(mhi.get("cut_loss_min_hold_hours", 24))
         return cls(
             symbol=symbol,
             cut_loss_pts=cut_loss_pts,
@@ -54,6 +58,8 @@ class MHImainStrategy:
                 take_profit_pts=take_profit_pts,
                 reentry_move_pts=reentry_move_pts,
                 reentry_trading_hours=reentry_trading_hours,
+                reentry_minimum_hours=reentry_minimum_hours,
+                cut_loss_min_hold_hours=cut_loss_min_hold_hours,
             ),
             panic_guard=PanicGuard(
                 move_pts=float(mhi.get("panic_move_pts", 200)),
@@ -72,8 +78,18 @@ class MHImainStrategy:
 
     def on_new_entry(self, entry_price: float) -> None:
         self.entry_price = entry_price
+        self.position_opened_at = datetime.now(timezone.utc)
         self.pnl_baseline.reset_on_new_entry()
         self._entry_armed = False
+
+    def on_broker_position_opened(self) -> None:
+        """Broker sync detected a new position (e.g. manual open). Start min-hold timer."""
+        self.position_opened_at = datetime.now(timezone.utc)
+        self._entry_armed = False
+
+    def on_broker_position_closed(self, exit_price: float) -> None:
+        """Broker sync detected flat (e.g. manual close). Apply post-exit cooldown."""
+        self.on_exit_cooldown(exit_price)
 
     def rearm_entry_if_flat(self, position: UnitPositionBook) -> None:
         if position.contracts == 0 and not self.pnl_baseline.locked:
@@ -149,8 +165,11 @@ class MHImainStrategy:
             self.entry_price = float(price)
 
         panic_blocked, panic_reason = self.panic_guard.blocks_cut_loss()
-        if not panic_blocked and self.pnl_baseline.should_cut_loss(
-            self.entry_price, float(price), position.position
+        hold_blocked, hold_reason = self.pnl_baseline.blocks_cut_loss_for_hold(self.position_opened_at)
+        if (
+            not panic_blocked
+            and not hold_blocked
+            and self.pnl_baseline.should_cut_loss(self.entry_price, float(price), position.position)
         ):
             self._pending_cut_loss = True
             trigger = self.pnl_baseline.cut_loss_trigger()
@@ -182,12 +201,13 @@ class MHImainStrategy:
 
         pnl_status = self.pnl_baseline.status_line(self.entry_price, float(price), position.position)
         label = f"holding long x{position.size}" if position.contracts > 0 else f"holding short x{position.size}"
-        if panic_blocked:
+        block_reason = panic_reason if panic_blocked else (hold_reason if hold_blocked else "")
+        if block_reason:
             return Signal(
                 "mhimain",
                 Action.HOLD,
                 trade_ticker,
-                f"{label} ({pnl_status}) [{panic_reason}]",
+                f"{label} ({pnl_status}) [{block_reason}]",
                 {"price": price},
             )
         return Signal("mhimain", Action.HOLD, trade_ticker, f"{label} ({pnl_status})", {"price": price})
@@ -197,6 +217,7 @@ class MHImainStrategy:
         self._pending_cut_loss = False
         self._pending_take_profit = False
         self.entry_price = None
+        self.position_opened_at = None
 
     def on_cut_loss_filled(self, exit_price: float) -> None:
         self.on_exit_cooldown(exit_price)
@@ -216,6 +237,7 @@ class MHImainStrategy:
             self.on_take_profit_filled(exit_price)
         else:
             self.entry_price = None
+            self.position_opened_at = None
             self._pending_cut_loss = False
             self._pending_take_profit = False
 

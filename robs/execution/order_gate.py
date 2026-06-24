@@ -10,7 +10,7 @@ from futu import RET_OK
 
 from robs.config import trd_env_from_config
 from robs.data.futu_client import TradeClient
-from robs.execution.position_sync import fetch_broker_position, refresh_broker_position
+from robs.execution.position_sync import fetch_broker_position
 from robs.strategy.rules import Action
 
 
@@ -66,6 +66,15 @@ class OrderGate:
         self.submitted_at = None
         self._logged_waiting = False
 
+    def is_close_intent(self, local_contracts: int) -> bool:
+        if self.signal_action == Action.FLAT:
+            return local_contracts != 0
+        if local_contracts > 0 and self.side == "SELL":
+            return True
+        if local_contracts < 0 and self.side == "BUY":
+            return True
+        return False
+
     def waiting_message(self) -> str:
         oid = self.order_id or "?"
         return f"order pending ({self.side} id={oid})"
@@ -110,7 +119,7 @@ class OrderGate:
 
         broker = fetch_broker_position(trade, symbol, cfg, quote_price=price)
         if self._broker_matches_intent(broker.contracts, position.contracts):
-            refresh_broker_position(broker, position, strategy, risk, cfg=cfg)
+            self._sync_broker_position(trade, cfg, symbol, position, strategy, risk, price)
             return "filled"
 
         if not self._logged_waiting:
@@ -141,4 +150,7 @@ class OrderGate:
         price: float,
     ) -> None:
         broker = fetch_broker_position(trade, symbol, cfg, quote_price=price)
-        refresh_broker_position(broker, position, strategy, risk, cfg=cfg)
+        position.contracts = broker.contracts
+        if broker.contracts == 0:
+            position.reset_after_flat()
+        risk.position_shares = broker.contracts

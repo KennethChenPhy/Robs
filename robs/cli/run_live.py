@@ -57,12 +57,11 @@ def main() -> None:
             while args.iterations is None or count < args.iterations:
                 frame = poller.poll_once()
                 if frame.empty:
+                    if poller.last_poll_at is not None and risk.check_stale(poller.last_poll_at, poll_interval):
+                        print("WARN: stale OpenD snapshot")
                     time.sleep(poll_interval)
                     count += 1
                     continue
-
-                if risk.check_stale(poller.last_poll_at, poll_interval):
-                    print("WARN: stale OpenD snapshot")
 
                 append_snapshots(cfg, frame)
                 closed = bars.ingest(frame)
