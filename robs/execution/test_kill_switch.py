@@ -5,14 +5,28 @@ from __future__ import annotations
 import unittest
 from unittest.mock import MagicMock, patch
 
-from robs.cli.mhimain import _handle_kill_switch, _process_signal
+from robs.cli.mhimain import _handle_kill_switch_portfolio, _process_signal
 from robs.execution.contract_rollover import ContractRolloverManager
+from robs.execution.mhi_portfolio import MHIPortfolio
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
 from robs.execution.risk import RiskManager
 from robs.strategy.mhimain import MHImainStrategy
 from robs.strategy.rules import Action, Signal
 from robs.strategy.trend import TrendMode
+
+
+def _portfolio(*, entry_contracts: int = 0) -> MHIPortfolio:
+    portfolio = MHIPortfolio.create(
+        {"mhimain": {}},
+        trend=TrendMode.BULL,
+        quote_symbol="HK.MHImain",
+    )
+    portfolio.update_front_context("HK.MHI2606", None)
+    if entry_contracts:
+        portfolio.entry_position.contracts = entry_contracts
+        portfolio.entry_book_code = "HK.MHI2606"
+    return portfolio
 
 
 class KillSwitchFlattenTests(unittest.TestCase):
@@ -46,19 +60,18 @@ class KillSwitchFlattenTests(unittest.TestCase):
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         risk.killed = True
         risk.kill_reason = "daily loss"
-        position = UnitPositionBook(contracts=0)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio()
 
         self.assertFalse(
-            _handle_kill_switch(
+            _handle_kill_switch_portfolio(
                 {"mhimain": {}},
                 MagicMock(),
-                position,
-                strategy,
+                portfolio,
                 risk,
+                MagicMock(),
                 "HK.MHImain",
-                None,
-                20000.0,
+                {},
+                {"HK.MHImain": 20000.0},
                 OrderGate(),
                 None,
             )
@@ -69,19 +82,18 @@ class KillSwitchFlattenTests(unittest.TestCase):
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         risk.killed = True
         risk.kill_reason = "daily loss 50.00% >= 50.0%"
-        position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio(entry_contracts=1)
 
         self.assertTrue(
-            _handle_kill_switch(
+            _handle_kill_switch_portfolio(
                 {"mhimain": {}},
                 MagicMock(),
-                position,
-                strategy,
+                portfolio,
                 risk,
+                MagicMock(),
                 "HK.MHImain",
-                None,
-                20000.0,
+                {},
+                {"HK.MHImain": 20000.0, "HK.MHI2606": 20000.0},
                 OrderGate(),
                 None,
             )
@@ -93,24 +105,25 @@ class KillSwitchFlattenTests(unittest.TestCase):
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         risk.killed = True
         risk.kill_reason = "daily loss"
-        position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio(entry_contracts=1)
+        leg = portfolio.ensure_leg("HK.MHI2606")
+        leg.position.contracts = 1
         rollover = ContractRolloverManager("HK.MHImain", {"mhimain": {"contract_rollover": True}})
         rollover.state.phase = "close"
         rollover.state.held_contract = "HK.MHI2606"
+        leg.rollover = rollover
 
-        _handle_kill_switch(
+        _handle_kill_switch_portfolio(
             {"mhimain": {}},
             MagicMock(),
-            position,
-            strategy,
+            portfolio,
             risk,
+            MagicMock(),
             "HK.MHImain",
-            None,
-            20000.0,
+            {},
+            {"HK.MHImain": 20000.0, "HK.MHI2606": 20000.0},
             OrderGate(),
             None,
-            rollover,
         )
         self.assertEqual(rollover.state.phase, "idle")
 

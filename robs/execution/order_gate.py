@@ -10,7 +10,8 @@ from futu import RET_OK
 
 from robs.config import trd_env_from_config
 from robs.data.futu_client import TradeClient
-from robs.execution.position_sync import fetch_broker_position
+from robs.execution.contract_rollover import is_hk_mhi_product_code
+from robs.execution.position_sync import fetch_broker_position, fetch_broker_position_for_code
 from robs.strategy.rules import Action
 
 
@@ -39,6 +40,7 @@ class OrderGate:
     signal_action: Action | None = None
     qty: float = 1.0
     submitted_at: float | None = None
+    order_code: str | None = None
     _logged_waiting: bool = False
 
     def mark_submitted(
@@ -48,12 +50,14 @@ class OrderGate:
         side: str,
         signal_action: Action,
         qty: float = 1.0,
+        order_code: str | None = None,
     ) -> None:
         self.pending = True
         self.order_id = str(order_id) if order_id is not None else None
         self.side = side.upper()
         self.signal_action = signal_action
         self.qty = qty
+        self.order_code = order_code
         self.submitted_at = time.monotonic()
         self._logged_waiting = False
 
@@ -63,6 +67,7 @@ class OrderGate:
         self.side = None
         self.signal_action = None
         self.qty = 1.0
+        self.order_code = None
         self.submitted_at = None
         self._logged_waiting = False
 
@@ -117,7 +122,7 @@ class OrderGate:
                     strategy.set_order_pending(False)
                     return "failed"
 
-        broker = fetch_broker_position(trade, symbol, cfg, quote_price=price)
+        broker = self._fetch_broker_for_gate(trade, cfg, symbol, price)
         if self._broker_matches_intent(broker.contracts, position.contracts):
             self._sync_broker_position(trade, cfg, symbol, position, strategy, risk, price)
             return "filled"
@@ -125,6 +130,17 @@ class OrderGate:
         if not self._logged_waiting:
             self._logged_waiting = True
         return None
+
+    def _fetch_broker_for_gate(
+        self,
+        trade: TradeClient,
+        cfg: dict,
+        symbol: str,
+        price: float,
+    ) -> Any:
+        if self.order_code and is_hk_mhi_product_code(self.order_code):
+            return fetch_broker_position_for_code(trade, self.order_code, cfg, quote_price=price)
+        return fetch_broker_position(trade, symbol, cfg, quote_price=price)
 
     def _broker_matches_intent(self, broker_contracts: int, local_contracts: int) -> bool:
         if self.signal_action in (Action.BUY, Action.SELL) and local_contracts == 0:
@@ -149,7 +165,7 @@ class OrderGate:
         risk: Any,
         price: float,
     ) -> None:
-        broker = fetch_broker_position(trade, symbol, cfg, quote_price=price)
+        broker = self._fetch_broker_for_gate(trade, cfg, symbol, price)
         position.contracts = broker.contracts
         if broker.contracts == 0:
             position.reset_after_flat()

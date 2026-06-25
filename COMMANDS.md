@@ -19,7 +19,7 @@ Quick cheat sheet for local Mac development and GCP VM deployment.
 ```bash
 cd ~/FTAPI4Python_10.4.6408/Robs
 source ../bin/activate          # optional; scripts use ../bin/python directly
-pip install -r requirements.txt # Mac: pyyaml, scipy (futu-api from parent venv)
+pip install -r requirements.txt # Mac: pyyaml (futu-api from parent venv)
 ```
 
 OpenD must be running locally at `127.0.0.1:11111`.
@@ -46,13 +46,7 @@ cd ~/FTAPI4Python_10.4.6408/Robs
 ./run_mhimain.sh --log-level INFO
 ./run_mhimain.sh --trade-password '…' # REAL / non-interactive
 
-# Other Robs CLIs (via run.sh)
-./run.sh robs/cli/collect.py --config default.yaml
-./run.sh robs/cli/debug_rules.py --iterations 20
-./run.sh robs/cli/backtest.py --config default.yaml
-./run.sh robs/cli/run_live.py --config default.yaml
-
-# Tests (52 tests)
+# Tests
 cd ~/FTAPI4Python_10.4.6408/Robs
 ../bin/python -m unittest discover -s robs -p 'test_*.py' -v
 ```

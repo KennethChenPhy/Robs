@@ -14,10 +14,9 @@ mhimain:
   # Futu code: HK.MHImain (auto front-month) or explicit month e.g. HK.MHI2607
   symbol: HK.MHImain
 
-  # When symbol is HK.MHImain: close held month and reopen on front month
+  # LTD: trade normally until 11:58 HKT, then roll in-position to next month; front flips 17:15
   contract_rollover: true
-  rollover_on_front_change: true    # when MHImain rolls e.g. 2606 → 2607
-  rollover_on_last_trade_day: true # also roll on the contract's last trading day
+  rollover_on_last_trade_day: true
 
   # Session trend when not passed via --trend (options: bull | bear | uncertain)
   #   bull       — only open long; close long for profit / cut loss

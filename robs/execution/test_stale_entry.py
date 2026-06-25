@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from zoneinfo import ZoneInfo
 
-from robs.cli.mhimain import _log_quote_stale, _process_signal, _stale_log_gate
+from robs.cli.mhimain import _log_quote_stale, _process_signal, _stale_log_gate, execute_unit_order
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
 from robs.execution.quote_staleness import QuoteFreshness, assess_quote_freshness
@@ -123,6 +123,26 @@ class StaleEntryBlockTests(unittest.TestCase):
             now=(hk_now + timedelta(seconds=1)).astimezone(timezone.utc),
         )
         self.assertFalse(fresh.block_entries)
+
+
+class ExecuteUnitOrderTests(unittest.TestCase):
+    def test_rejects_when_portfolio_exceeds_max_position(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 1}})
+        risk.position_shares = 1
+        position = UnitPositionBook(contracts=0)
+        trade = MagicMock()
+        result = execute_unit_order(
+            {"mhimain": {}},
+            trade,
+            position,
+            Action.BUY,
+            "HK.MHImain",
+            quote_row={"last_price": 20000.0, "ask_price": 20001.0, "bid_price": 19999.0},
+            risk=risk,
+            portfolio_total_signed=1,
+        )
+        self.assertEqual(result["status"], "rejected")
+        trade.place_market_order.assert_not_called()
 
 
 if __name__ == "__main__":

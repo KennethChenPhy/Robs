@@ -6,15 +6,27 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
-from robs.cli.mhimain import _handle_auth_expiry
+from robs.cli.mhimain import _handle_auth_expiry_portfolio
+from robs.execution.mhi_portfolio import MHIPortfolio
 from robs.execution.order_gate import OrderGate
-from robs.execution.position import UnitPositionBook
-from robs.execution.position_sync import BrokerPosition
 from robs.execution.risk import RiskManager
 from robs.execution.trade_unlock import TradeUnlockSession
 from robs.strategy.mhimain import MHImainStrategy
 from robs.strategy.rules import Action
 from robs.strategy.trend import TrendMode
+
+
+def _portfolio(*, entry_contracts: int = 0) -> MHIPortfolio:
+    portfolio = MHIPortfolio.create(
+        {"mhimain": {}},
+        trend=TrendMode.BULL,
+        quote_symbol="HK.MHImain",
+    )
+    portfolio.update_front_context("HK.MHI2606", None)
+    if entry_contracts:
+        portfolio.entry_position.contracts = entry_contracts
+        portfolio.entry_book_code = "HK.MHI2606"
+    return portfolio
 
 
 class AuthExpiryHandlerTests(unittest.TestCase):
@@ -27,20 +39,19 @@ class AuthExpiryHandlerTests(unittest.TestCase):
         session = TradeUnlockSession(valid_days=30, password="secret")
         session.authorized_at = datetime.now(timezone.utc)
         trade = MagicMock()
-        position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio(entry_contracts=1)
         risk = RiskManager({"risk": {"max_position_shares": 1}})
 
         self.assertFalse(
-            _handle_auth_expiry(
+            _handle_auth_expiry_portfolio(
                 {"mhimain": {}},
                 trade,
-                position,
-                strategy,
+                portfolio,
                 risk,
+                MagicMock(),
                 "HK.MHImain",
-                None,
-                20000.0,
+                {},
+                {"HK.MHImain": 20000.0},
                 OrderGate(),
                 session,
             )
@@ -51,94 +62,78 @@ class AuthExpiryHandlerTests(unittest.TestCase):
         session = TradeUnlockSession(valid_days=30, password="secret")
         session.authorized_at = datetime.now(timezone.utc)
         session.locked = True
-        position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio(entry_contracts=1)
         risk = RiskManager({"risk": {"max_position_shares": 1}})
 
-        with patch("robs.cli.mhimain._process_signal") as mock_process:
+        with patch("robs.cli.mhimain._submit_forced_flat") as mock_flat:
             self.assertFalse(
-                _handle_auth_expiry(
+                _handle_auth_expiry_portfolio(
                     {"mhimain": {}},
                     trade,
-                    position,
-                    strategy,
+                    portfolio,
                     risk,
+                    MagicMock(),
                     "HK.MHImain",
-                    None,
-                    20000.0,
+                    {},
+                    {"HK.MHImain": 20000.0},
                     OrderGate(),
                     session,
                 )
             )
-        mock_process.assert_not_called()
+        mock_flat.assert_not_called()
 
     def test_expired_cancels_pending_entry(self) -> None:
         session = self._session_expired()
         trade = MagicMock()
-        position = UnitPositionBook(contracts=0)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
-        risk = RiskManager({"risk": {"max_position_shares": 1}})
+        portfolio = _portfolio()
         gate = OrderGate()
         gate.mark_submitted(order_id="9", side="BUY", signal_action=Action.BUY, qty=1.0)
-        strategy.set_order_pending(True)
+        portfolio.entry_strategy.set_order_pending(True)
+        risk = RiskManager({"risk": {"max_position_shares": 1}})
 
-        with patch("robs.cli.mhimain._process_signal") as mock_process:
+        with patch("robs.cli.mhimain._submit_forced_flat") as mock_flat:
             self.assertTrue(
-                _handle_auth_expiry(
+                _handle_auth_expiry_portfolio(
                     {"mhimain": {}},
                     trade,
-                    position,
-                    strategy,
+                    portfolio,
                     risk,
+                    MagicMock(),
                     "HK.MHImain",
-                    None,
-                    20000.0,
+                    {},
+                    {"HK.MHImain": 20000.0},
                     gate,
                     session,
                 )
             )
         self.assertFalse(gate.pending)
-        mock_process.assert_not_called()
+        mock_flat.assert_not_called()
 
-    @patch("robs.cli.mhimain._process_signal")
-    @patch("robs.cli.mhimain.fetch_broker_position")
-    def test_expired_with_position_submits_flat(self, mock_fetch: MagicMock, mock_process: MagicMock) -> None:
-        mock_fetch.return_value = BrokerPosition(
-            code="HK.MHImain",
-            contracts=1,
-            qty=1,
-            entry_price=19900.0,
-            current_price=20000.0,
-            pnl_points=100.0,
-            pnl_val=None,
-        )
+    @patch("robs.cli.mhimain._submit_forced_flat", return_value=True)
+    def test_expired_with_position_submits_flat(self, mock_flat: MagicMock) -> None:
         trade = MagicMock()
         trade._ctx.unlock_trade.return_value = (0, None)
         session = self._session_expired()
-        position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
-        strategy.entry_price = 19900.0
+        portfolio = _portfolio(entry_contracts=1)
+        portfolio.entry_strategy.entry_price = 19900.0
         risk = RiskManager({"risk": {"max_position_shares": 1}})
-        gate = OrderGate()
 
         self.assertTrue(
-            _handle_auth_expiry(
+            _handle_auth_expiry_portfolio(
                 {"mhimain": {"trd_env": "REAL"}},
                 trade,
-                position,
-                strategy,
+                portfolio,
                 risk,
+                MagicMock(),
                 "HK.MHImain",
-                None,
-                20000.0,
-                gate,
+                {},
+                {"HK.MHImain": 20000.0, "HK.MHI2606": 20000.0},
+                OrderGate(),
                 session,
             )
         )
-        mock_process.assert_called_once()
-        signal = mock_process.call_args.args[5]
-        self.assertEqual(signal.action, Action.FLAT)
-        self.assertTrue(mock_process.call_args.kwargs.get("skip_auth_check"))
+        mock_flat.assert_called_once()
+        self.assertEqual(mock_flat.call_args.kwargs.get("order_code"), "HK.MHI2606")
         trade._ctx.unlock_trade.assert_called_with("secret")
 
     @patch("getpass.getpass", return_value="newsecret")
@@ -146,21 +141,20 @@ class AuthExpiryHandlerTests(unittest.TestCase):
         trade = MagicMock()
         trade._ctx.unlock_trade.return_value = (0, None)
         session = self._session_expired()
-        position = UnitPositionBook(contracts=0)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        portfolio = _portfolio()
         risk = RiskManager({"risk": {"max_position_shares": 1}})
 
         with patch("sys.stdin.isatty", return_value=True):
             self.assertFalse(
-                _handle_auth_expiry(
+                _handle_auth_expiry_portfolio(
                     {"mhimain": {}},
                     trade,
-                    position,
-                    strategy,
+                    portfolio,
                     risk,
+                    MagicMock(),
                     "HK.MHImain",
-                    None,
-                    20000.0,
+                    {},
+                    {"HK.MHImain": 20000.0},
                     OrderGate(),
                     session,
                 )

@@ -4,10 +4,20 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
+
+import pandas as pd
 
 from robs.execution.cut_loss import PositionPnLBaseline
 from robs.execution.position import UnitPositionBook
-from robs.execution.position_sync import BrokerPosition, apply_broker_position, refresh_broker_position
+from robs.execution.position_sync import (
+    BrokerPosition,
+    apply_broker_position,
+    fetch_broker_mhi_legs,
+    fetch_broker_position,
+    fetch_broker_position_for_code,
+    refresh_broker_position,
+)
 from robs.strategy.mhimain import MHImainStrategy
 
 
@@ -128,6 +138,78 @@ class ReentryCooldownTests(unittest.TestCase):
         blocked, reason = bl.blocks_entry(23900.0)
         self.assertFalse(blocked)
         self.assertIn("cleared", reason)
+
+
+class NonMhiBrokerFetchTests(unittest.TestCase):
+    def test_fetch_broker_position_for_code_rejects_hti(self) -> None:
+        trade = MagicMock()
+        broker = fetch_broker_position_for_code(trade, "HK.HTI2606", {"trd_env": "SIMULATE"})
+        self.assertEqual(broker.contracts, 0)
+        trade._ctx.position_list_query.assert_not_called()
+
+
+class MultiContractPositionFetchTests(unittest.TestCase):
+    def _multi_leg_df(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {
+                    "code": "HK.MHI2606",
+                    "qty": 2,
+                    "position_side": "LONG",
+                    "cost_price": 19900.0,
+                },
+                {
+                    "code": "HK.MHI2607",
+                    "qty": 1,
+                    "position_side": "SHORT",
+                    "cost_price": 20050.0,
+                },
+            ]
+        )
+
+    def test_fetch_for_code_picks_matching_row_not_first(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.return_value = (0, self._multi_leg_df())
+        broker = fetch_broker_position_for_code(
+            trade, "HK.MHI2607", {"trd_env": "SIMULATE"}, quote_price=20010.0
+        )
+        self.assertEqual(broker.code, "HK.MHI2607")
+        self.assertEqual(broker.contracts, -1)
+        self.assertEqual(broker.entry_price, 20050.0)
+
+    def test_fetch_for_code_falls_back_to_account_query(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.side_effect = [
+            (0, pd.DataFrame()),
+            (0, self._multi_leg_df()),
+        ]
+        broker = fetch_broker_position_for_code(trade, "HK.MHI2606", {"trd_env": "SIMULATE"})
+        self.assertEqual(broker.code, "HK.MHI2606")
+        self.assertEqual(broker.contracts, 2)
+
+    def test_fetch_broker_position_named_month_exact(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.return_value = (0, self._multi_leg_df())
+        broker = fetch_broker_position(trade, "HK.MHI2607", {"trd_env": "SIMULATE"})
+        self.assertEqual(broker.contracts, -1)
+
+    def test_fetch_mhi_legs_preserves_per_contract_qty(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.side_effect = [
+            (0, pd.DataFrame()),
+            (0, self._multi_leg_df()),
+        ]
+        legs = fetch_broker_mhi_legs(
+            trade,
+            "HK.MHImain",
+            {"trd_env": "SIMULATE"},
+            quote_prices={"HK.MHI2606": 19950.0, "HK.MHI2607": 20010.0},
+        )
+        by_code = {leg.code: leg for leg in legs}
+        self.assertEqual(by_code["HK.MHI2606"].contracts, 2)
+        self.assertEqual(by_code["HK.MHI2607"].contracts, -1)
+        self.assertEqual(by_code["HK.MHI2606"].current_price, 19950.0)
+        self.assertEqual(by_code["HK.MHI2607"].current_price, 20010.0)
 
 
 if __name__ == "__main__":

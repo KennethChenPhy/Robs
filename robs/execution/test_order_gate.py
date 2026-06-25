@@ -53,6 +53,43 @@ class OrderGateFillTests(unittest.TestCase):
         gate.mark_submitted(order_id="2", side="SELL", signal_action=Action.FLAT, qty=1.0)
         self.assertTrue(gate.is_close_intent(1))
 
+    @patch("robs.execution.order_gate.fetch_broker_position_for_code")
+    def test_fill_uses_order_code_position(self, mock_fetch_code: MagicMock) -> None:
+        mock_fetch_code.return_value = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=1,
+            qty=1,
+            entry_price=20000.0,
+            current_price=20010.0,
+            pnl_points=10.0,
+            pnl_val=None,
+        )
+        trade = MagicMock()
+        trade._ctx.order_list_query.return_value = (1, None)
+
+        position = UnitPositionBook(contracts=0)
+        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        risk = MagicMock()
+
+        gate = OrderGate()
+        gate.mark_submitted(
+            order_id="1",
+            side="BUY",
+            signal_action=Action.BUY,
+            qty=1.0,
+            order_code="HK.MHI2607",
+        )
+
+        outcome = gate.try_resolve(
+            trade, {"mhimain": {}}, "HK.MHImain", position, strategy, risk, 20010.0
+        )
+
+        self.assertEqual(outcome, "filled")
+        self.assertEqual(position.contracts, 1)
+        mock_fetch_code.assert_called_with(
+            trade, "HK.MHI2607", {"mhimain": {}}, quote_price=20010.0
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -24,7 +24,7 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
     return merged
 
 
-def load_config(name: str = "default.yaml") -> dict[str, Any]:
+def load_config(name: str = "mhimain.yaml") -> dict[str, Any]:
     path = CONFIG_DIR / name
     if not path.exists():
         raise FileNotFoundError(f"Config not found: {path}")
