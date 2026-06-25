@@ -28,6 +28,7 @@ from robs.execution.contract_rollover import (
     contract_log_label,
     hkex_spot_startup_message,
     is_continuous_mhi,
+    is_hk_mhi_product_code,
     is_ltd_expiring_month_open_banned,
     is_named_mhi_contract,
     local_contract_last_trade_time,
@@ -42,7 +43,13 @@ from robs.execution.mhi_portfolio import (
 )
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
-from robs.execution.position_sync import BrokerPosition, fetch_broker_mhi_legs, live_pnl_points
+from robs.execution.position_sync import (
+    BrokerPosition,
+    fetch_broker_mhi_legs,
+    fetch_broker_position,
+    fetch_broker_position_for_code,
+    live_pnl_points,
+)
 from robs.execution.quote_staleness import (
     QuoteFreshness,
     assess_quote_freshness,
@@ -814,12 +821,20 @@ def _process_signal(
             strategy.rearm_entry_if_flat(position)
         return
 
+    if is_hk_mhi_product_code(trade_code):
+        broker_before = fetch_broker_position_for_code(
+            trade, trade_code, cfg, quote_price=price,
+        )
+    else:
+        broker_before = fetch_broker_position(trade, symbol, cfg, quote_price=price)
     order_gate.mark_submitted(
         order_id=result.get("order_id"),
         side=side,
         signal_action=signal.action,
         qty=float(result.get("qty", order_qty)),
         order_code=trade_code,
+        local_contracts_at_submit=position.contracts,
+        broker_contracts_at_submit=broker_before.contracts,
     )
     strategy.set_order_pending(True)
 

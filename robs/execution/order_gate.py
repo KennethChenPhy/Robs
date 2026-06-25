@@ -41,6 +41,8 @@ class OrderGate:
     qty: float = 1.0
     submitted_at: float | None = None
     order_code: str | None = None
+    local_contracts_at_submit: int | None = None
+    broker_contracts_at_submit: int | None = None
     _logged_waiting: bool = False
     logged_submit: bool = False
 
@@ -52,6 +54,8 @@ class OrderGate:
         signal_action: Action,
         qty: float = 1.0,
         order_code: str | None = None,
+        local_contracts_at_submit: int | None = None,
+        broker_contracts_at_submit: int | None = None,
     ) -> None:
         self.pending = True
         self.order_id = str(order_id) if order_id is not None else None
@@ -59,6 +63,8 @@ class OrderGate:
         self.signal_action = signal_action
         self.qty = qty
         self.order_code = order_code
+        self.local_contracts_at_submit = local_contracts_at_submit
+        self.broker_contracts_at_submit = broker_contracts_at_submit
         self.submitted_at = time.monotonic()
         self._logged_waiting = False
         self.logged_submit = False
@@ -70,6 +76,8 @@ class OrderGate:
         self.signal_action = None
         self.qty = 1.0
         self.order_code = None
+        self.local_contracts_at_submit = None
+        self.broker_contracts_at_submit = None
         self.submitted_at = None
         self._logged_waiting = False
         self.logged_submit = False
@@ -118,7 +126,10 @@ class OrderGate:
                 status = str(row.get("order_status", ""))
                 dealt_qty = float(row.get("dealt_qty") or 0)
                 if _is_filled(status, dealt_qty, self.qty):
-                    self._sync_broker_position(trade, cfg, symbol, position, strategy, risk, price)
+                    self._sync_broker_position(
+                        trade, cfg, symbol, position, strategy, risk, price,
+                        dealt_qty=dealt_qty,
+                    )
                     return "filled"
                 if _terminal_failure(status):
                     self.clear()
@@ -127,7 +138,9 @@ class OrderGate:
 
         broker = self._fetch_broker_for_gate(trade, cfg, symbol, price)
         if self._broker_matches_intent(broker.contracts, position.contracts):
-            self._sync_broker_position(trade, cfg, symbol, position, strategy, risk, price)
+            self._sync_broker_position(
+                trade, cfg, symbol, position, strategy, risk, price,
+            )
             return "filled"
 
         if not self._logged_waiting:
@@ -145,7 +158,27 @@ class OrderGate:
             return fetch_broker_position_for_code(trade, self.order_code, cfg, quote_price=price)
         return fetch_broker_position(trade, symbol, cfg, quote_price=price)
 
+    def _expected_broker_contracts(self, dealt_qty: float | None = None) -> int | None:
+        """Signed contracts on this order_code after the pending order completes."""
+        if self.broker_contracts_at_submit is None:
+            return None
+        local = self.local_contracts_at_submit or 0
+        q = int(dealt_qty if dealt_qty is not None else self.qty)
+        if self.is_close_intent(local):
+            sign = 1 if local > 0 else -1
+            close_q = min(q, abs(local))
+            return local - sign * close_q
+        if self.side == "BUY":
+            return self.broker_contracts_at_submit + q
+        if self.side == "SELL":
+            return self.broker_contracts_at_submit - q
+        return None
+
     def _broker_matches_intent(self, broker_contracts: int, local_contracts: int) -> bool:
+        expected = self._expected_broker_contracts()
+        if expected is not None:
+            if self.signal_action in (Action.BUY, Action.SELL, Action.FLAT):
+                return broker_contracts == expected
         if self.signal_action in (Action.BUY, Action.SELL) and local_contracts == 0:
             if self.side == "BUY":
                 return broker_contracts >= self.qty
@@ -167,9 +200,15 @@ class OrderGate:
         strategy: Any,
         risk: Any,
         price: float,
+        *,
+        dealt_qty: float | None = None,
     ) -> None:
-        broker = self._fetch_broker_for_gate(trade, cfg, symbol, price)
-        position.contracts = broker.contracts
-        if broker.contracts == 0:
+        expected = self._expected_broker_contracts(dealt_qty)
+        if expected is not None:
+            position.contracts = expected
+        else:
+            broker = self._fetch_broker_for_gate(trade, cfg, symbol, price)
+            position.contracts = broker.contracts
+        if position.contracts == 0:
             position.reset_after_flat()
-        risk.position_shares = broker.contracts
+        risk.position_shares = position.contracts

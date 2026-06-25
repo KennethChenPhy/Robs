@@ -199,16 +199,21 @@ def _fetch_broker_row(
     return _row_for_contract_code(filtered, code)
 
 
-def _group_mhi_rows_by_code(data: Any, default_code: str) -> dict[str, Any]:
-    """Group broker rows by contract code (one merged row per product)."""
+def _group_mhi_row_lists(data: Any, default_code: str) -> dict[str, list[Any]]:
+    """Group broker rows by contract code."""
     grouped: dict[str, list[Any]] = {}
     for _, row in data.iterrows():
         code = str(row.get("code", default_code)).upper()
         if not is_hk_mhi_product_code(code):
             continue
         grouped.setdefault(code, []).append(row)
+    return grouped
+
+
+def _group_mhi_rows_by_code(data: Any, default_code: str) -> dict[str, Any]:
+    """Group broker rows by contract code (one merged row per product)."""
     out: dict[str, Any] = {}
-    for code, row_list in grouped.items():
+    for code, row_list in _group_mhi_row_lists(data, default_code).items():
         if len(row_list) == 1:
             out[code] = row_list[0]
         else:
@@ -274,11 +279,14 @@ def fetch_broker_mhi_legs(
 
     data = _match_position_rows(data, symbol)
     legs: list[BrokerPosition] = []
-    for code, row in _group_mhi_rows_by_code(data, symbol).items():
+    for code, row_list in _group_mhi_row_lists(data, symbol).items():
         px = (quote_prices or {}).get(code)
         if px is None and quote_prices and not is_named_mhi_contract(code):
             px = quote_prices.get(symbol)
-        broker = _broker_position_from_row(row, code, px)
+        if len(row_list) > 1:
+            broker = fetch_broker_position_for_code(trade, code, cfg, quote_price=px)
+        else:
+            broker = _broker_position_from_row(row_list[0], code, px)
         if broker.contracts != 0:
             legs.append(broker)
     return legs

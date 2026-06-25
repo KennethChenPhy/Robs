@@ -78,6 +78,8 @@ class OrderGateFillTests(unittest.TestCase):
             signal_action=Action.BUY,
             qty=1.0,
             order_code="HK.MHI2607",
+            local_contracts_at_submit=0,
+            broker_contracts_at_submit=0,
         )
 
         outcome = gate.try_resolve(
@@ -89,6 +91,85 @@ class OrderGateFillTests(unittest.TestCase):
         mock_fetch_code.assert_called_with(
             trade, "HK.MHI2607", {"mhimain": {}}, quote_price=20010.0
         )
+
+    @patch("robs.execution.order_gate.fetch_broker_position_for_code")
+    def test_open_does_not_fill_on_preexisting_broker_position(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = BrokerPosition(
+            code="HK.MHI2606",
+            contracts=1,
+            qty=1,
+            entry_price=23000.0,
+            current_price=23031.0,
+            pnl_points=31.0,
+            pnl_val=None,
+        )
+        trade = MagicMock()
+        trade._ctx.order_list_query.return_value = (1, None)
+
+        position = UnitPositionBook(contracts=0)
+        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        risk = MagicMock()
+
+        gate = OrderGate()
+        gate.mark_submitted(
+            order_id="1",
+            side="BUY",
+            signal_action=Action.BUY,
+            qty=1.0,
+            order_code="HK.MHI2606",
+            local_contracts_at_submit=0,
+            broker_contracts_at_submit=1,
+        )
+
+        outcome = gate.try_resolve(
+            trade, {"mhimain": {}}, "HK.MHImain", position, strategy, risk, 23031.0
+        )
+
+        self.assertIsNone(outcome)
+        self.assertEqual(position.contracts, 0)
+
+    @patch("robs.execution.order_gate.fetch_broker_position_for_code")
+    def test_fill_uses_order_dealt_qty_not_overcounted_broker(self, mock_fetch: MagicMock) -> None:
+        mock_fetch.return_value = BrokerPosition(
+            code="HK.MHI2606",
+            contracts=2,
+            qty=2,
+            entry_price=23032.0,
+            current_price=23031.0,
+            pnl_points=-1.0,
+            pnl_val=None,
+        )
+        trade = MagicMock()
+        import pandas as pd
+
+        trade._ctx.order_list_query.return_value = (
+            0,
+            pd.DataFrame(
+                [{"order_status": "FILLED_ALL", "dealt_qty": 1.0, "qty": 1.0}],
+            ),
+        )
+
+        position = UnitPositionBook(contracts=0)
+        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        risk = MagicMock()
+
+        gate = OrderGate()
+        gate.mark_submitted(
+            order_id="8486510",
+            side="BUY",
+            signal_action=Action.BUY,
+            qty=1.0,
+            order_code="HK.MHI2606",
+            local_contracts_at_submit=0,
+            broker_contracts_at_submit=0,
+        )
+
+        outcome = gate.try_resolve(
+            trade, {"mhimain": {}}, "HK.MHImain", position, strategy, risk, 23031.0
+        )
+
+        self.assertEqual(outcome, "filled")
+        self.assertEqual(position.contracts, 1)
 
 
 if __name__ == "__main__":

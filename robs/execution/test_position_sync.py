@@ -212,6 +212,45 @@ class MultiContractPositionFetchTests(unittest.TestCase):
         self.assertEqual(by_code["HK.MHI2606"].current_price, 19950.0)
         self.assertEqual(by_code["HK.MHI2607"].current_price, 20010.0)
 
+    def test_fetch_mhi_legs_requeries_duplicate_rows_for_same_code(self) -> None:
+        dup_df = pd.DataFrame(
+            [
+                {
+                    "code": "HK.MHI2606",
+                    "qty": 1,
+                    "position_side": "LONG",
+                    "cost_price": 23031.0,
+                },
+                {
+                    "code": "HK.MHI2606",
+                    "qty": 1,
+                    "position_side": "LONG",
+                    "cost_price": 23031.0,
+                },
+            ]
+        )
+        trade = MagicMock()
+        trade._ctx.position_list_query.side_effect = [
+            (0, pd.DataFrame()),
+            (0, dup_df),
+            (0, pd.DataFrame(
+                [{
+                    "code": "HK.MHI2606",
+                    "qty": 1,
+                    "position_side": "LONG",
+                    "cost_price": 23031.0,
+                }]
+            )),
+        ]
+        legs = fetch_broker_mhi_legs(
+            trade,
+            "HK.MHImain",
+            {"trd_env": "SIMULATE"},
+            quote_prices={"HK.MHI2606": 23031.0},
+        )
+        self.assertEqual(len(legs), 1)
+        self.assertEqual(legs[0].contracts, 1)
+
     def test_fetch_mhi_legs_does_not_substitute_mhimain_for_missing_month(self) -> None:
         trade = MagicMock()
         trade._ctx.position_list_query.side_effect = [
