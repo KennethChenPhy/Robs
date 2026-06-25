@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from robs.cli.mhimain import _handle_kill_switch, _process_signal
+from robs.execution.contract_rollover import ContractRolloverManager
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
 from robs.execution.risk import RiskManager
@@ -86,6 +87,32 @@ class KillSwitchFlattenTests(unittest.TestCase):
             )
         )
         mock_flat.assert_called_once()
+
+    @patch("robs.cli.mhimain._submit_forced_flat", return_value=False)
+    def test_kill_switch_resets_rollover(self, _mock_flat: MagicMock) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 1}})
+        risk.killed = True
+        risk.kill_reason = "daily loss"
+        position = UnitPositionBook(contracts=1)
+        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        rollover = ContractRolloverManager("HK.MHImain", {"mhimain": {"contract_rollover": True}})
+        rollover.state.phase = "close"
+        rollover.state.held_contract = "HK.MHI2606"
+
+        _handle_kill_switch(
+            {"mhimain": {}},
+            MagicMock(),
+            position,
+            strategy,
+            risk,
+            "HK.MHImain",
+            None,
+            20000.0,
+            OrderGate(),
+            None,
+            rollover,
+        )
+        self.assertEqual(rollover.state.phase, "idle")
 
 
 if __name__ == "__main__":

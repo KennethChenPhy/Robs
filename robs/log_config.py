@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 _LOG_RECORD_SKIP = frozenset(
@@ -44,18 +45,62 @@ class StructuredFormatter(logging.Formatter):
         return json.dumps(payload, default=str, ensure_ascii=False)
 
 
-def setup_logging(cfg: dict[str, Any], *, level: str | None = None, fmt: str | None = None) -> None:
+def resolve_log_file(
+    cfg: dict[str, Any],
+    *,
+    log_file: str | None = None,
+    no_log_file: bool = False,
+) -> Path | None:
+    """Resolve log file path relative to project root; None disables file logging."""
+    if no_log_file:
+        return None
+
+    log_cfg = cfg.get("logging", {})
+    raw = log_file if log_file is not None else log_cfg.get("file", "logs/mhimain.jsonl")
+    if raw in (None, False, ""):
+        return None
+
+    path = Path(str(raw))
+    if not path.is_absolute():
+        root = Path(str(cfg.get("_project_root", Path.cwd())))
+        path = root / path
+    return path
+
+
+def setup_logging(
+    cfg: dict[str, Any],
+    *,
+    level: str | None = None,
+    fmt: str | None = None,
+    log_file: str | None = None,
+    no_log_file: bool = False,
+) -> Path | None:
     log_cfg = cfg.get("logging", {})
     resolved_level = str(level or log_cfg.get("level", "INFO")).upper()
     resolved_fmt = str(fmt or log_cfg.get("format", "json")).lower()
+    stdout_enabled = bool(log_cfg.get("stdout", True))
 
-    handler = logging.StreamHandler(sys.stdout)
-    handler.setFormatter(StructuredFormatter(resolved_fmt))
+    formatter = StructuredFormatter(resolved_fmt)
+    handlers: list[logging.Handler] = []
+
+    if stdout_enabled:
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(formatter)
+        handlers.append(stream_handler)
+
+    file_path = resolve_log_file(cfg, log_file=log_file, no_log_file=no_log_file)
+    if file_path is not None:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(file_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        handlers.append(file_handler)
 
     root = logging.getLogger("robs")
     root.handlers.clear()
-    root.addHandler(handler)
+    for handler in handlers:
+        root.addHandler(handler)
     root.setLevel(resolved_level)
     root.propagate = False
 
     logging.getLogger("futu").setLevel(logging.WARNING)
+    return file_path

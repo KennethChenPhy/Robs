@@ -25,6 +25,13 @@ if str(PROJECT_ROOT) not in sys.path:
 from robs.config import load_config, trd_env_from_config, trd_env_name
 from robs.data.futu_client import QuoteClient, TradeClient, endpoints_from_config
 from robs.execution.alarm import play_panic_alarm
+from robs.execution.contract_rollover import (
+    ContractRolloverManager,
+    is_continuous_mhi,
+    is_named_mhi_contract,
+    order_code_for_position,
+    should_rollover,
+)
 from robs.execution.market_guard import allow_market_order
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
@@ -262,7 +269,10 @@ def _process_signal(
     skip_auth_check: bool = False,
     force_flat: bool = False,
     quote_freshness: QuoteFreshness | None = None,
+    order_code: str | None = None,
+    bypass_entry_guards: bool = False,
 ) -> None:
+    trade_code = order_code or symbol
     if order_gate.pending:
         outcome = order_gate.try_resolve(trade, cfg, symbol, position, strategy, risk, price)
         if outcome == "filled":
@@ -291,6 +301,7 @@ def _process_signal(
 
     if (
         not force_flat
+        and not bypass_entry_guards
         and quote_freshness is not None
         and quote_freshness.block_entries
         and is_new_entry(position.contracts, signal.action)
@@ -318,7 +329,8 @@ def _process_signal(
             return
 
     result = execute_unit_order(
-        cfg, trade, position, signal.action, symbol, quote_row=quote_row, trade_unlock=trade_unlock
+        cfg, trade, position, signal.action, symbol, quote_row=quote_row,
+        trade_unlock=trade_unlock, order_code=trade_code,
     )
     side = position.resolve_order_side(signal.action)
     if side is None:
@@ -470,12 +482,18 @@ def _submit_forced_flat(
         return False
     if trade_unlock is not None:
         trade_unlock.ensure_broker_unlocked(trade)
+    close_code = symbol
+    if is_continuous_mhi(symbol):
+        broker = fetch_broker_position(trade, symbol, cfg, quote_price=price)
+        if broker.contracts != 0 and is_named_mhi_contract(broker.code):
+            close_code = broker.code
     flat = Signal(rule, Action.FLAT, symbol, reason, {"price": price})
     _process_signal(
         cfg, trade, position, strategy, risk,
         flat, symbol, quote_row, price, order_gate, trade_unlock,
         skip_auth_check=True,
         force_flat=True,
+        order_code=close_code,
     )
     return order_gate.pending or position.contracts != 0
 
@@ -491,10 +509,14 @@ def _handle_kill_switch(
     price: float,
     order_gate: OrderGate,
     trade_unlock: TradeUnlockSession | None,
+    rollover: ContractRolloverManager | None = None,
 ) -> bool:
     """Flatten on kill switch before halting. Returns True to skip strategy signals."""
     if not risk.killed:
         return False
+
+    if rollover is not None and rollover.busy():
+        rollover.reset()
 
     if not risk._kill_close_announced:
         risk._kill_close_announced = True
@@ -526,6 +548,140 @@ def _handle_kill_switch(
     return False
 
 
+def _handle_contract_rollover(
+    cfg: dict,
+    trade: TradeClient,
+    quote: QuoteClient,
+    position: UnitPositionBook,
+    strategy: MHImainStrategy,
+    risk: RiskManager,
+    quote_symbol: str,
+    quote_row,
+    price: float,
+    order_gate: OrderGate,
+    trade_unlock: TradeUnlockSession | None,
+    rollover: ContractRolloverManager,
+    *,
+    front_contract: str | None,
+    held_contract: str | None,
+    last_trade_time: str | None,
+) -> bool:
+    """Close expiring month and reopen on front month. Returns True to skip strategy."""
+    if not rollover.active():
+        return False
+
+    mhi_cfg = cfg.get("mhimain", {})
+    on_front = bool(mhi_cfg.get("rollover_on_front_change", True))
+    on_last = bool(mhi_cfg.get("rollover_on_last_trade_day", True))
+
+    rollover.note_held_contract(held_contract, position.contracts)
+    rollover.state.front_contract = front_contract
+
+    if order_gate.pending and rollover.busy():
+        return True
+
+    if rollover.state.phase == "idle":
+        if position.contracts == 0:
+            return False
+        held = held_contract or rollover.state.held_contract
+        if not held or not is_named_mhi_contract(held):
+            return False
+        do_roll, reason = should_rollover(
+            held,
+            front_contract,
+            last_trade_time,
+            on_front_change=on_front,
+            on_last_trade_day=on_last,
+        )
+        if not do_roll or not front_contract:
+            return False
+        _cancel_pending_entry(
+            order_gate,
+            strategy,
+            position,
+            reason="rollover — cancelling pending entry order",
+        )
+        rollover.begin(
+            held=held,
+            front=front_contract,
+            direction=1 if position.contracts > 0 else -1,
+            reason=reason,
+        )
+        LOG.warning(
+            "contract rollover started",
+            extra={
+                "event": "contract_rollover",
+                "phase": "close",
+                "reason": reason,
+                "held_contract": held,
+                "front_contract": front_contract,
+                "direction": rollover.state.direction,
+            },
+        )
+
+    if rollover.state.phase == "close":
+        if position.contracts == 0:
+            rollover.advance_after_close(0)
+        else:
+            close_code = rollover.state.held_contract or held_contract or quote_symbol
+            flat = Signal(
+                "rollover",
+                Action.FLAT,
+                quote_symbol,
+                f"rollover close {close_code} ({rollover.state.reason})",
+                {"price": price},
+            )
+            _process_signal(
+                cfg, trade, position, strategy, risk,
+                flat, quote_symbol, quote_row, price, order_gate, trade_unlock,
+                skip_auth_check=True,
+                force_flat=True,
+                order_code=close_code,
+            )
+            return True
+
+    if rollover.state.phase == "open":
+        if position.contracts != 0:
+            rollover.complete_if_opened(position.contracts)
+            return False
+        open_code = rollover.state.target_contract or front_contract
+        if not open_code:
+            return True
+        held = rollover.state.held_contract
+        if held and open_code.upper() == held.upper():
+            LOG.error(
+                "contract rollover aborted — front month same as expired contract",
+                extra={
+                    "event": "contract_rollover",
+                    "phase": "open",
+                    "held_contract": held,
+                    "front_contract": open_code,
+                },
+            )
+            rollover.reset()
+            return True
+        if order_gate.pending:
+            return True
+        action = Action.BUY if rollover.state.direction > 0 else Action.SELL
+        open_sig = Signal(
+            "rollover",
+            action,
+            quote_symbol,
+            f"rollover open {open_code} ({rollover.state.reason})",
+            {"price": price},
+        )
+        _process_signal(
+            cfg, trade, position, strategy, risk,
+            open_sig, quote_symbol, quote_row, price, order_gate, trade_unlock,
+            skip_auth_check=True,
+            bypass_entry_guards=True,
+            order_code=open_code,
+        )
+        return True
+
+    return False
+
+
 def _handle_auth_expiry(
     cfg: dict,
     trade: TradeClient,
@@ -537,10 +693,14 @@ def _handle_auth_expiry(
     price: float,
     order_gate: OrderGate,
     trade_unlock: TradeUnlockSession,
+    rollover: ContractRolloverManager | None = None,
 ) -> bool:
     """Expiry shutdown: flatten first, then lock. Returns True to skip strategy signals."""
     if not trade_unlock.is_expired():
         return False
+
+    if rollover is not None and rollover.busy():
+        rollover.reset()
 
     if order_gate.pending and not order_gate.is_close_intent(position.contracts):
         _cancel_pending_entry(
@@ -588,7 +748,9 @@ def execute_unit_order(
     quote_row=None,
     *,
     trade_unlock: TradeUnlockSession | None = None,
+    order_code: str | None = None,
 ) -> dict:
+    code = order_code or symbol
     ok, reason = position.validate_transition(action)
     if not ok:
         return {"status": "rejected", "reason": reason}
@@ -611,7 +773,7 @@ def execute_unit_order(
             }
 
     result = trade.place_market_order(
-        code=symbol,
+        code=code,
         qty=order_qty,
         side=side,
         trd_env=trd_env_from_config(cfg),
@@ -748,10 +910,31 @@ def main() -> None:
         default=None,
         help="Log level (default: logging.level in config)",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Log file path (default: logging.file in config, logs/mhimain.jsonl)",
+    )
+    parser.add_argument(
+        "--no-log-file",
+        action="store_true",
+        help="Disable file logging (stdout/journal only)",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg, level=args.log_level, fmt=args.log_format)
+    log_path = setup_logging(
+        cfg,
+        level=args.log_level,
+        fmt=args.log_format,
+        log_file=args.log_file,
+        no_log_file=args.no_log_file,
+    )
+    if log_path is not None:
+        LOG.info(
+            "file logging enabled",
+            extra={"event": "logging", "log_file": str(log_path)},
+        )
     mhi_cfg = cfg.get("mhimain", {})
     data_cfg = cfg.get("data", {})
     symbol = str(mhi_cfg.get("symbol", "HK.MHImain"))
@@ -849,6 +1032,20 @@ def main() -> None:
 
         _print_bootstrap(symbol, strategy, position, quote_price, broker_pnl_val=broker.pnl_val)
 
+        rollover_mgr = ContractRolloverManager(symbol, cfg)
+        front_contract: str | None = None
+        if rollover_mgr.active():
+            ok_front, front_contract = quote.resolve_front_contract(symbol)
+            if ok_front and front_contract:
+                LOG.info(
+                    "front-month contract resolved",
+                    extra={
+                        "event": "contract_rollover",
+                        "quote_symbol": symbol,
+                        "front_contract": front_contract,
+                    },
+                )
+
         order_gate = OrderGate()
         poll_display = PollDisplayGate(threshold_pts=poll_display_threshold)
         if quote_price is not None:
@@ -883,14 +1080,20 @@ def main() -> None:
                         },
                     )
                     _, trade_row = quote.quote_for_trade(symbol, row=launch_row)
+                    launch_order = order_code_for_position(
+                        symbol, position.contracts, broker.code if broker.contracts else None, front_contract
+                    )
                     _process_signal(
                         cfg, trade, position, strategy, risk,
                         launch_signal, symbol, trade_row, quote_price, order_gate, trade_unlock,
                         quote_freshness=launch_fresh,
+                        order_code=launch_order,
                     )
 
         count = 0
         last_poll_at = None
+        last_live_price: float | None = quote_price
+        last_quote_row = quote_data.iloc[0] if ret_ok and quote_data is not None and len(quote_data) else None
         last_position_refresh = time.monotonic()
         try:
             while args.iterations is None or count < args.iterations:
@@ -913,6 +1116,41 @@ def main() -> None:
                         "quote poll failed — check OpenD / quote subscription",
                         extra={"event": "quote_poll_failed", "symbol": symbol},
                     )
+                    now_mono = time.monotonic()
+                    if now_mono - last_position_refresh >= position_refresh_sec:
+                        _refresh_account_equity(trade, cfg, risk)
+                        last_position_refresh = now_mono
+                    if last_live_price is not None and (
+                        risk.killed
+                        or (trade_unlock is not None and trade_unlock.is_expired())
+                    ):
+                        fail_trade_row = (
+                            _trade_row(quote, symbol, last_quote_row)
+                            if last_quote_row is not None
+                            else None
+                        )
+                        if _handle_kill_switch(
+                            cfg, trade, position, strategy, risk,
+                            symbol, fail_trade_row, last_live_price, order_gate, trade_unlock,
+                            rollover_mgr,
+                        ):
+                            time.sleep(poll_interval)
+                            count += 1
+                            continue
+                        if trade_unlock is not None and _handle_auth_expiry(
+                            cfg, trade, position, strategy, risk,
+                            symbol, fail_trade_row, last_live_price, order_gate, trade_unlock,
+                            rollover_mgr,
+                        ):
+                            time.sleep(poll_interval)
+                            count += 1
+                            continue
+                        if risk.killed and position.contracts == 0 and not order_gate.pending:
+                            LOG.error(
+                                "kill switch halt",
+                                extra={"event": "kill_switch_halt", "reason": risk.kill_reason},
+                            )
+                            break
                     time.sleep(poll_interval)
                     count += 1
                     continue
@@ -925,6 +1163,8 @@ def main() -> None:
 
                 row = data.iloc[0]
                 price = float(row["last_price"])
+                last_live_price = price
+                last_quote_row = row
                 update_time = str(row.get("data_time", ""))
                 quote_fresh = assess_quote_freshness(
                     cfg,
@@ -964,9 +1204,23 @@ def main() -> None:
                     _refresh_account_equity(trade, cfg, risk)
                     last_position_refresh = now_mono
 
+                held_contract: str | None = None
+                last_trade_time: str | None = None
+                if is_continuous_mhi(symbol):
+                    if rollover_mgr.active():
+                        ok_front, resolved_front = quote.resolve_front_contract(symbol)
+                        if ok_front and resolved_front:
+                            front_contract = resolved_front
+                    broker_snap = fetch_broker_position(trade, symbol, cfg, quote_price=price)
+                    if broker_snap.contracts != 0 and is_named_mhi_contract(broker_snap.code):
+                        held_contract = broker_snap.code
+                        if rollover_mgr.active():
+                            last_trade_time = quote.contract_last_trade_time(held_contract)
+
                 if _handle_kill_switch(
                     cfg, trade, position, strategy, risk,
                     symbol, _trade_row(quote, symbol, row), price, order_gate, trade_unlock,
+                    rollover_mgr,
                 ):
                     time.sleep(poll_interval)
                     count += 1
@@ -975,6 +1229,19 @@ def main() -> None:
                 if trade_unlock is not None and _handle_auth_expiry(
                     cfg, trade, position, strategy, risk,
                     symbol, _trade_row(quote, symbol, row), price, order_gate, trade_unlock,
+                    rollover_mgr,
+                ):
+                    time.sleep(poll_interval)
+                    count += 1
+                    continue
+
+                if _handle_contract_rollover(
+                    cfg, trade, quote, position, strategy, risk,
+                    symbol, _trade_row(quote, symbol, row), price, order_gate, trade_unlock,
+                    rollover_mgr,
+                    front_contract=front_contract,
+                    held_contract=held_contract,
+                    last_trade_time=last_trade_time,
                 ):
                     time.sleep(poll_interval)
                     count += 1
@@ -990,6 +1257,8 @@ def main() -> None:
                     cooldown_tag += " [PANIC_PAUSE]"
                 if order_gate.pending:
                     cooldown_tag += " [ORDER_PENDING]"
+                if rollover_mgr.busy():
+                    cooldown_tag += " [ROLLOVER]"
                 cooldown_tag += quote_fresh.status_tag
                 status = signal.reason
                 if signal.action != Action.HOLD:
@@ -1015,10 +1284,14 @@ def main() -> None:
                     )
                     break
 
+                trade_order_code = order_code_for_position(
+                    symbol, position.contracts, held_contract, front_contract
+                )
                 _process_signal(
                     cfg, trade, position, strategy, risk,
                     signal, symbol, _trade_row(quote, symbol, row), price, order_gate, trade_unlock,
                     quote_freshness=quote_fresh,
+                    order_code=trade_order_code,
                 )
 
                 time.sleep(poll_interval)

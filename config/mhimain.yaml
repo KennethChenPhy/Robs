@@ -2,6 +2,8 @@
 logging:
   level: INFO       # DEBUG | INFO | WARNING | ERROR
   format: json      # json | text (key=value lines)
+  file: logs/mhimain.jsonl   # append JSON lines; set empty to disable
+  stdout: true      # also print to console / journalctl
 
 # Futu OpenD connection
 futu:
@@ -11,6 +13,11 @@ futu:
 mhimain:
   # Futu code: HK.MHImain (auto front-month) or explicit month e.g. HK.MHI2607
   symbol: HK.MHImain
+
+  # When symbol is HK.MHImain: close held month and reopen on front month
+  contract_rollover: true
+  rollover_on_front_change: true    # when MHImain rolls e.g. 2606 → 2607
+  rollover_on_last_trade_day: true # also roll on the contract's last trading day
 
   # Session trend when not passed via --trend (options: bull | bear | uncertain)
   #   bull       — only open long; close long for profit / cut loss

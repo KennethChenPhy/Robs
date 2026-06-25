@@ -105,6 +105,7 @@ def fetch_broker_position(
         )
 
     row = data.iloc[0]
+    actual_code = str(row.get("code", symbol))
     qty = float(row.get("qty", 0))
     signed = _qty_to_signed(qty, str(row.get("position_side", "")))
     entry = _pick_cost(row)
@@ -126,7 +127,7 @@ def fetch_broker_position(
     pnl_val = float(pl_val) if pl_val is not None and pl_val == pl_val else None
 
     return BrokerPosition(
-        code=symbol,
+        code=actual_code,
         contracts=signed,
         qty=qty,
         entry_price=entry,

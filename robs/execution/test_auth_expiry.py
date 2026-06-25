@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 from robs.cli.mhimain import _handle_auth_expiry
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
+from robs.execution.position_sync import BrokerPosition
 from robs.execution.risk import RiskManager
 from robs.execution.trade_unlock import TradeUnlockSession
 from robs.strategy.mhimain import MHImainStrategy
@@ -100,7 +101,17 @@ class AuthExpiryHandlerTests(unittest.TestCase):
         mock_process.assert_not_called()
 
     @patch("robs.cli.mhimain._process_signal")
-    def test_expired_with_position_submits_flat(self, mock_process: MagicMock) -> None:
+    @patch("robs.cli.mhimain.fetch_broker_position")
+    def test_expired_with_position_submits_flat(self, mock_fetch: MagicMock, mock_process: MagicMock) -> None:
+        mock_fetch.return_value = BrokerPosition(
+            code="HK.MHImain",
+            contracts=1,
+            qty=1,
+            entry_price=19900.0,
+            current_price=20000.0,
+            pnl_points=100.0,
+            pnl_val=None,
+        )
         trade = MagicMock()
         trade._ctx.unlock_trade.return_value = (0, None)
         session = self._session_expired()

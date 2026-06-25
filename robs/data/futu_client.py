@@ -97,6 +97,91 @@ class QuoteClient:
             return False, None
         return True, float(closes.tail(period).mean())
 
+    def resolve_front_contract(self, symbol: str) -> tuple[bool, str | None]:
+        """Map HK.MHImain to the current front-month contract code (e.g. HK.MHI2607)."""
+        sym = str(symbol).upper()
+        if sym != "HK.MHIMAIN":
+            return True, symbol
+
+        from futu import RET_OK, SecurityReferenceType
+
+        from robs.execution.contract_rollover import is_named_mhi_contract, parse_last_trade_date
+
+        ret, data = self._ctx.get_referencestock_list(symbol, SecurityReferenceType.FUTURE)
+        if ret == RET_OK and data is not None and len(data) > 0:
+            if "future_main_contract" in data.columns:
+                mains = data[data["future_main_contract"] == True]  # noqa: E712
+                if len(mains) > 0:
+                    code = str(mains.iloc[0]["code"])
+                    if is_named_mhi_contract(code):
+                        return True, code
+
+            best_code: str | None = None
+            best_last = None
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            today = datetime.now(ZoneInfo("Asia/Hong_Kong")).date()
+            time_col = "future_last_trade_time" if "future_last_trade_time" in data.columns else "last_trade_time"
+            for _, row in data.iterrows():
+                code = str(row.get("code", ""))
+                if not is_named_mhi_contract(code):
+                    continue
+                last_day = parse_last_trade_date(str(row.get(time_col, "")))
+                if last_day is None or last_day < today:
+                    continue
+                if best_last is None or last_day < best_last:
+                    best_last = last_day
+                    best_code = code
+            if best_code:
+                return True, best_code
+
+        return self._resolve_front_from_candidates()
+
+    def _resolve_front_from_candidates(self) -> tuple[bool, str | None]:
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from futu import RET_OK
+
+        from robs.execution.contract_rollover import is_named_mhi_contract, parse_last_trade_date
+
+        now_hk = datetime.now(ZoneInfo("Asia/Hong_Kong"))
+        year = now_hk.year % 100
+        month = now_hk.month
+        candidates: list[str] = []
+        m, y = month, year
+        for _ in range(8):
+            candidates.append(f"HK.MHI{y:02d}{m:02d}")
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
+
+        today = now_hk.date()
+        best_code: str | None = None
+        best_last = None
+        for code in candidates:
+            ret, data = self._ctx.get_future_info(code)
+            if ret != RET_OK or data is None or len(data) == 0:
+                continue
+            last_day = parse_last_trade_date(str(data.iloc[0].get("last_trade_time", "")))
+            if last_day is None or last_day < today:
+                continue
+            if best_last is None or last_day < best_last:
+                best_last = last_day
+                best_code = code
+        return (best_code is not None), best_code
+
+    def contract_last_trade_time(self, code: str) -> str | None:
+        from futu import RET_OK
+
+        ret, data = self._ctx.get_future_info(code)
+        if ret != RET_OK or data is None or len(data) == 0:
+            return None
+        val = data.iloc[0].get("last_trade_time")
+        return str(val) if val is not None else None
+
 
 class TradeClient:
     def __init__(self, endpoints: FutuEndpoints, *, futures: bool = False) -> None:

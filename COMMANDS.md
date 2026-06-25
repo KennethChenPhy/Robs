@@ -198,6 +198,36 @@ OpenD port **11111 is not exposed** to the internet — localhost on VM only.
 
 ---
 
+## Logs
+
+Structured logs go to **stdout** (terminal / `journalctl`) and, by default, a JSON Lines file:
+
+| Run mode | File path |
+|----------|-----------|
+| Mac | `~/FTAPI4Python_10.4.6408/Robs/logs/mhimain.jsonl` |
+| GCP VM / systemd | `~/Robs/logs/mhimain.jsonl` |
+
+```bash
+# Tail file on VM
+tail -f ~/Robs/logs/mhimain.jsonl
+
+# Disable file logging for one run
+./run_mhimain.sh --no-log-file
+
+# Custom path
+./run_mhimain.sh --log-file logs/debug.jsonl
+```
+
+Config (`config/mhimain.yaml`):
+
+```yaml
+logging:
+  file: logs/mhimain.jsonl   # empty/null to disable
+  stdout: true               # false = file only
+```
+
+---
+
 ## Config quick reference (`config/mhimain.yaml`)
 
 | Key | Typical value |
@@ -209,6 +239,8 @@ OpenD port **11111 is not exposed** to the internet — localhost on VM only.
 | `risk.max_daily_loss_pct` | `50` |
 | `logging.format` | `json` or `text` |
 | `logging.level` | `INFO` |
+| `logging.file` | `logs/mhimain.jsonl` |
+| `logging.stdout` | `true` |
 
 ---
 
