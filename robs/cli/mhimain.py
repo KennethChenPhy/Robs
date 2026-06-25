@@ -42,7 +42,7 @@ from robs.execution.mhi_portfolio import (
 )
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
-from robs.execution.position_sync import fetch_broker_mhi_legs, live_pnl_points
+from robs.execution.position_sync import BrokerPosition, fetch_broker_mhi_legs, live_pnl_points
 from robs.execution.quote_staleness import (
     QuoteFreshness,
     assess_quote_freshness,
@@ -1666,9 +1666,35 @@ def _refresh_broker_positions_if_due(
             ]
         if changed_codes:
             _report_broker_position_changes(
-                symbol, portfolio, changed_codes, prices, fallback_price,
+                symbol,
+                portfolio,
+                changed_codes,
+                prices,
+                fallback_price,
+                broker_legs=broker_legs,
             )
     return now_mono
+
+
+def _price_for_position_refresh(
+    code: str,
+    prices: dict[str, float],
+    quote_symbol: str,
+    front_contract: str | None,
+    fallback_price: float | None,
+    broker_by_code: dict[str, BrokerPosition] | None = None,
+) -> float | None:
+    """Last price for position_refresh; never substitute MHImain for non-front months."""
+    px = _resolve_contract_poll_price(prices, code, quote_symbol, front_contract)
+    if px is not None:
+        return px
+    if broker_by_code:
+        broker = broker_by_code.get(code)
+        if broker is not None and broker.current_price is not None:
+            return broker.current_price
+    if is_named_mhi_contract(code):
+        return None
+    return fallback_price
 
 
 def _report_broker_position_changes(
@@ -1678,15 +1704,20 @@ def _report_broker_position_changes(
     prices: dict[str, float],
     fallback_price: float | None,
     *,
+    broker_legs: list[BrokerPosition] | None = None,
     title_prefix: str = "Refresh",
 ) -> None:
+    broker_by_code = {b.code: b for b in (broker_legs or [])}
     for change in changes:
         code = change.code
-        px = prices.get(code)
-        if px is None and portfolio.front_contract and code.upper() == portfolio.front_contract.upper():
-            px = prices.get(quote_symbol)
-        if px is None:
-            px = fallback_price
+        px = _price_for_position_refresh(
+            code,
+            prices,
+            quote_symbol,
+            portfolio.front_contract,
+            fallback_price,
+            broker_by_code,
+        )
         if change.book == "entry":
             strategy = portfolio.entry_strategy
             position = portfolio.entry_position

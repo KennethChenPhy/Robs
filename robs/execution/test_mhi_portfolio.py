@@ -495,6 +495,47 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
         self.assertIn("flat (0)", msg)
         self.assertIsNone(portfolio.leg_for_code("HK.MHI2607"))
 
+    def test_report_leg_refresh_does_not_use_front_month_price(self) -> None:
+        from robs.cli.mhimain import _report_broker_position_changes
+        from robs.execution.mhi_portfolio import BrokerPositionChange
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        risk = RiskManager({"risk": {"max_position_shares": 8}})
+        broker = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=1,
+            qty=1,
+            entry_price=22995.0,
+            current_price=23010.0,
+            pnl_points=15.0,
+            pnl_val=None,
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 25, 10, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            portfolio.bootstrap_from_broker([broker], risk, ma5=None, front_contract="HK.MHI2606")
+        changes = [BrokerPositionChange(code="HK.MHI2607", contracts=1, book="leg")]
+        with patch("robs.cli.mhimain.LOG") as mock_log:
+            _report_broker_position_changes(
+                "HK.MHImain",
+                portfolio,
+                changes,
+                {"HK.MHImain": 23036.0},
+                23036.0,
+                broker_legs=[broker],
+            )
+        msg = str(mock_log.info.call_args[0][0])
+        self.assertIn("MHI2607", msg)
+        self.assertIn("last 23010", msg)
+        self.assertNotIn("last 23036", msg)
+
     def test_roll_day_entry_persists_after_roll_day(self) -> None:
         from robs.execution.risk import RiskManager
 
