@@ -1,7 +1,7 @@
 # Structured logging (mhimain CLI)
 logging:
   level: INFO       # DEBUG | INFO | WARNING | ERROR
-  format: json      # json | text (key=value lines)
+  format: text      # json | text (key=value lines)
   file: logs/mhimain.jsonl   # append JSON lines; set empty to disable
   stdout: true      # also print to console / journalctl
 
@@ -26,15 +26,15 @@ mhimain:
 
   ma_period: 10              # daily MA length for uncertain entries
 
-  # P/L exits measured from launch baseline (or 0 for new entries this session)
+  # P/L exits from entry price (per contract): cut at -cut_loss_pts, profit at +take_profit_pts
   cut_loss_pts: 20         # close when P/L is launch − 200 pts
   take_profit_pts: 40      # close when P/L is launch + 400 pts
-  cut_loss_min_hold_hours: 0.12  # no cut loss until position held this long (take profit still allowed)
+  cut_loss_min_hold_hours: 0.012  # no cut loss until position held this long (take profit still allowed)
 
   # Re-entry block after any exit; clears when ALL apply:
-  reentry_minimum_hours: 0.4   #   always wait at least this long (even if price moves enough)
+  reentry_minimum_hours: 0.01   #   always wait at least this long (even if price moves enough)
   reentry_move_pts: 30      #   then price moves 300 pts from exit, or
-  reentry_trading_hours: 0.24   #   reentry_trading_hours elapse (whichever clears first after minimum)
+  reentry_trading_hours: 0.02   #   reentry_trading_hours elapse (whichever clears first after minimum)
 
   # Panic pause: block cut loss (not take profit) after a violent move
   panic_move_pts: 150
@@ -58,10 +58,12 @@ mhimain:
   position_refresh_sec: 2
 
 data:
-  poll_interval_sec: 1      # seconds between quote polls
-  poll_display_threshold_pts: 40  # only print status when price moves this many pts
+  poll_interval_sec: 2      # seconds between quote polls
+  poll_display_threshold_pts: 10  # only print status when price moves this many pts
 
 risk:
+  # Max net contracts (entry book + legs); reject orders that would exceed |total|
+  max_position_shares: 4
   # Kill switch: stop trading if account equity drops by this % from session day-start baseline
   max_daily_loss_pct: 50.0
   # Fallback when OpenD accinfo unavailable at startup (HKD total_assets)

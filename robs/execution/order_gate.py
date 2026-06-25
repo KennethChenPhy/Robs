@@ -42,6 +42,7 @@ class OrderGate:
     submitted_at: float | None = None
     order_code: str | None = None
     _logged_waiting: bool = False
+    logged_submit: bool = False
 
     def mark_submitted(
         self,
@@ -60,6 +61,7 @@ class OrderGate:
         self.order_code = order_code
         self.submitted_at = time.monotonic()
         self._logged_waiting = False
+        self.logged_submit = False
 
     def clear(self) -> None:
         self.pending = False
@@ -70,6 +72,7 @@ class OrderGate:
         self.order_code = None
         self.submitted_at = None
         self._logged_waiting = False
+        self.logged_submit = False
 
     def is_close_intent(self, local_contracts: int) -> bool:
         if self.signal_action == Action.FLAT:

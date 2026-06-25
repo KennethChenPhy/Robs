@@ -49,10 +49,69 @@ def _qty_to_signed(qty: float, position_side: str) -> int:
     if qty == 0:
         return 0
     n = int(abs(qty))
-    side = str(position_side).upper()
-    if "SHORT" in side or qty < 0:
+    side = str(position_side or "").upper().strip()
+    if "SHORT" in side or side in ("S", "SELL"):
         return -n
+    if qty < 0:
+        return -n
+    if "LONG" in side or side in ("B", "BUY"):
+        return n
     return n
+
+
+def _infer_signed_when_side_unknown(row: Any, n: int) -> int:
+    """Best-effort short vs long when Futu reports position_side N/A."""
+    if n == 0:
+        return 0
+    qty_f = float(row.get("qty", 0) or 0)
+    can_sell = row.get("can_sell_qty")
+    if can_sell is not None and can_sell == can_sell and qty_f > 0:
+        cs = float(can_sell)
+        if cs == 0:
+            return -n
+        if cs >= qty_f:
+            return n
+    entry = _pick_cost(row)
+    nominal = row.get("nominal_price")
+    for pl_key in ("pl_val", "unrealized_pl"):
+        pl_val = row.get(pl_key)
+        if (
+            entry is not None
+            and nominal is not None
+            and nominal == nominal
+            and pl_val is not None
+            and pl_val == pl_val
+        ):
+            entry_f, nom_f, pl_f = float(entry), float(nominal), float(pl_val)
+            if pl_f < 0 and nom_f > entry_f:
+                return -n
+            if pl_f < 0 and nom_f < entry_f:
+                return n
+            if pl_f > 0 and nom_f > entry_f:
+                return n
+            if pl_f > 0 and nom_f < entry_f:
+                return -n
+            long_pl = nom_f - entry_f
+            short_pl = entry_f - nom_f
+            if abs(pl_f - short_pl) < abs(pl_f - long_pl):
+                return -n
+            return n
+    return n
+
+
+def _signed_contracts_from_row(row: Any) -> int:
+    """Signed contracts from a Futu position row (handles N/A position_side)."""
+    qty = float(row.get("qty", 0) or 0)
+    side = str(row.get("position_side", "") or "")
+    side_up = side.upper().strip()
+    if side_up not in ("", "N/A", "NONE", "UNKNOWN"):
+        return _qty_to_signed(qty, side)
+    if qty < 0:
+        return int(qty)
+    n = int(abs(qty))
+    if n == 0:
+        return 0
+    return _infer_signed_when_side_unknown(row, n)
 
 
 def _empty_mhi_position(symbol: str, quote_price: float | None = None) -> BrokerPosition:
@@ -104,10 +163,7 @@ def _aggregate_position_rows(rows: Any, code: str) -> Any:
     total_signed = 0.0
     first = rows.iloc[0]
     for _, row in rows.iterrows():
-        total_signed += _qty_to_signed(
-            float(row.get("qty", 0)),
-            str(row.get("position_side", "")),
-        )
+        total_signed += _signed_contracts_from_row(row)
     merged = first.copy()
     merged["code"] = code
     if total_signed == 0:
@@ -166,8 +222,8 @@ def _broker_position_from_row(
     quote_price: float | None,
 ) -> BrokerPosition:
     actual_code = str(row.get("code", symbol))
-    qty = float(row.get("qty", 0))
-    signed = _qty_to_signed(qty, str(row.get("position_side", "")))
+    signed = _signed_contracts_from_row(row)
+    qty = float(row.get("qty", 0) or 0)
     entry = _pick_cost(row)
     if quote_price is not None:
         current = quote_price
@@ -220,7 +276,7 @@ def fetch_broker_mhi_legs(
     legs: list[BrokerPosition] = []
     for code, row in _group_mhi_rows_by_code(data, symbol).items():
         px = (quote_prices or {}).get(code)
-        if px is None and quote_prices:
+        if px is None and quote_prices and not is_named_mhi_contract(code):
             px = quote_prices.get(symbol)
         broker = _broker_position_from_row(row, code, px)
         if broker.contracts != 0:
@@ -381,8 +437,10 @@ def refresh_broker_position(
     if update_risk:
         risk.position_shares = broker.contracts
 
-    if new_pos != 0 and (old_pos == 0 or sign_changed):
-        strategy.on_broker_position_opened()
+    if new_pos != 0 and old_pos != new_pos:
+        if old_pos == 0 or sign_changed:
+            strategy.on_broker_position_opened()
+        strategy.pnl_baseline.reset_on_new_entry()
 
     if new_pos == 0:
         strategy.rearm_entry_if_flat(position_book)

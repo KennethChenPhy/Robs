@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -15,7 +14,6 @@ from robs.execution.contract_rollover import (
     is_named_mhi_contract,
     quote_symbols_for_portfolio,
     resolve_entry_order_code,
-    roll_forward_entry_code,
 )
 from robs.execution.position import UnitPositionBook
 from robs.execution.position_sync import (
@@ -26,7 +24,12 @@ from robs.execution.position_sync import (
 from robs.strategy.mhimain import MHImainStrategy
 from robs.strategy.trend import TrendMode
 
-LOG = logging.getLogger("robs.mhimain")
+
+@dataclass(frozen=True)
+class BrokerPositionChange:
+    code: str
+    book: str
+    contracts: int
 
 
 @dataclass
@@ -53,6 +56,7 @@ class MHIPortfolio:
     front_contract: str | None = None
     front_last_trade_time: str | None = None
     _subscribed: list[str] = field(default_factory=list)
+    _last_broker_contracts: dict[str, int] = field(default_factory=dict, repr=False)
 
     @classmethod
     def create(cls, cfg: dict[str, Any], *, trend: TrendMode, quote_symbol: str) -> MHIPortfolio:
@@ -113,27 +117,53 @@ class MHIPortfolio:
         return bool(self.cfg.get("mhimain", {}).get("rollover_on_last_trade_day", True))
 
     def entry_watch_code(self) -> str | None:
-        """Quote next month while flat on the front month's last trading day."""
-        if self.active_leg_codes():
+        """Named month we'd quote for flat entries (e.g. next month on LTD roll day)."""
+        if self.active_leg_codes() or self.entry_position.contracts != 0:
             return None
-        return roll_forward_entry_code(
-            self.front_contract,
-            self.front_last_trade_time,
-            enabled=self._roll_on_last_trade_day(),
-        )
+        front = self.front_contract
+        if not front or not is_named_mhi_contract(front):
+            return None
+        resolved = self.resolve_entry_order_code(front)
+        if (
+            resolved
+            and is_named_mhi_contract(resolved)
+            and resolved.upper() != front.upper()
+        ):
+            return resolved
+        return None
 
-    def quote_symbols(self) -> list[str]:
-        held = list(self.active_leg_codes())
+    def _quoted_month_codes(self) -> list[str]:
+        """Named months that need their own quote (held, watch, rollover targets)."""
+        codes: set[str] = set(self.active_leg_codes())
         if self.entry_position.contracts != 0:
             entry_code = self.managed_entry_code()
-            if is_named_mhi_contract(entry_code) and entry_code not in held:
-                held.append(entry_code)
-        watch = (
-            self.entry_watch_code()
-            if not held and self.entry_position.contracts == 0
-            else None
-        )
-        return quote_symbols_for_portfolio(self.quote_symbol, held, watch_code=watch)
+            if is_named_mhi_contract(entry_code):
+                codes.add(entry_code)
+        watch = self.entry_watch_code()
+        if watch:
+            codes.add(watch)
+        rollover = self.entry_rollover
+        if rollover is not None and rollover.active():
+            st = rollover.state
+            if st.target_contract:
+                codes.add(st.target_contract)
+            if st.held_contract:
+                codes.add(st.held_contract)
+        for leg in self.active_legs():
+            if leg.rollover is None or not leg.rollover.active():
+                continue
+            st = leg.rollover.state
+            if st.target_contract:
+                codes.add(st.target_contract)
+            if st.held_contract:
+                codes.add(st.held_contract)
+        front = self.front_contract
+        if front and is_named_mhi_contract(front):
+            codes.add(front)
+        return sorted(codes, key=lambda c: contract_month_key(c) or (0, 0))
+
+    def quote_symbols(self) -> list[str]:
+        return quote_symbols_for_portfolio(self.quote_symbol, self._quoted_month_codes())
 
     def resolve_entry_order_code(self, front_contract: str | None) -> str:
         return resolve_entry_order_code(
@@ -172,7 +202,7 @@ class MHIPortfolio:
         return self.managed_entry_code().upper() != front.upper()
 
     def tracks_on_entry_book(self, code: str) -> bool:
-        """True if this broker row belongs on entry_position (not a manual next-month leg)."""
+        """True if this broker row belongs on entry_position (not a manual month leg)."""
         if not is_hk_mhi_product_code(code):
             return False
         if self.entry_position.contracts != 0 and self.entry_book_code:
@@ -184,6 +214,11 @@ class MHIPortfolio:
         if self.is_roll_day_entry():
             return False
         return self.is_front_month_code(code)
+
+    def entry_book_code_active(self) -> str | None:
+        if self.entry_position.contracts != 0 and self.entry_book_code:
+            return self.entry_book_code
+        return None
 
     def tracks_as_next_month_leg(self, code: str) -> bool:
         """Manual next-month row: flat-only leg, never bot roll-day entry book."""
@@ -250,6 +285,61 @@ class MHIPortfolio:
     def _sync_risk_shares(self, risk: Any) -> None:
         risk.position_shares = self.total_signed_contracts()
 
+    def _note_broker_contracts(self, code: str, broker_contracts: int) -> None:
+        self._last_broker_contracts[str(code).upper()] = broker_contracts
+
+    def _broker_contracts_reportable(self, code: str, broker_contracts: int) -> bool:
+        """True when broker-reported signed contracts changed since last refresh."""
+        key = str(code).upper()
+        prev = self._last_broker_contracts.get(key)
+        self._note_broker_contracts(code, broker_contracts)
+        return prev is None or prev != broker_contracts
+
+    def _broker_row_missing(self, code: str, by_code: dict[str, BrokerPosition]) -> bool:
+        """True when broker no longer reports an open position on this contract."""
+        if not by_code:
+            return True
+        row = by_code.get(code)
+        if row is None:
+            for key, broker in by_code.items():
+                if key.upper() == str(code).upper():
+                    row = broker
+                    break
+        return row is None or row.contracts == 0
+
+    def _resolve_entry_matched(self, by_code: dict[str, BrokerPosition]) -> str | None:
+        """Broker month row for the entry book only (never a manual next-month leg)."""
+        rollover = self.entry_rollover
+        if rollover is not None and rollover.busy():
+            st = rollover.state
+            if st.phase == "open" and st.target_contract and st.target_contract in by_code:
+                return st.target_contract
+            if st.phase == "close" and st.held_contract and st.held_contract in by_code:
+                return st.held_contract
+        front = self.front_contract
+        if front and front in by_code and is_named_mhi_contract(front):
+            resolved = self.resolve_entry_order_code(front)
+            if (
+                resolved
+                and resolved.upper() != front.upper()
+                and (
+                    self.entry_position.contracts == 0
+                    or (
+                        self.entry_book_code
+                        and self.entry_book_code.upper() == front.upper()
+                    )
+                )
+            ):
+                return front
+        for code in self._entry_broker_sync_codes():
+            if code in by_code and self.tracks_on_entry_book(code):
+                return code
+        if len(by_code) == 1:
+            only = next(iter(by_code))
+            if self.tracks_on_entry_book(only):
+                return only
+        return None
+
     def bootstrap_from_broker(
         self,
         broker_legs: list[BrokerPosition],
@@ -261,25 +351,35 @@ class MHIPortfolio:
         self.entry_strategy.set_ma5(ma5)
         if front_contract:
             self.front_contract = front_contract
-        for broker in broker_legs:
-            if broker.contracts == 0 or not is_hk_mhi_product_code(broker.code):
+        by_code = {
+            b.code: b
+            for b in broker_legs
+            if b.contracts != 0 and is_hk_mhi_product_code(b.code)
+        }
+        matched = self._resolve_entry_matched(by_code)
+        if matched is not None:
+            broker = by_code[matched]
+            self._drop_leg_if_any(matched)
+            apply_broker_position(
+                broker, self.entry_position, self.entry_strategy, bootstrap=True
+            )
+            self._note_entry_book_code(matched)
+            self.entry_strategy.on_broker_position_opened()
+        for code, broker in by_code.items():
+            if matched is not None and code.upper() == matched.upper():
                 continue
-            if self.tracks_on_entry_book(broker.code):
-                self._drop_leg_if_any(broker.code)
-                apply_broker_position(
-                    broker, self.entry_position, self.entry_strategy, bootstrap=True
-                )
-                self._note_entry_book_code(broker.code)
-                self.entry_strategy.on_broker_position_opened()
-            elif self.tracks_as_next_month_leg(broker.code):
-                leg = self.ensure_leg(broker.code)
-                apply_broker_position(broker, leg.position, leg.strategy, bootstrap=True)
-                leg.strategy.on_broker_position_opened()
+            if not is_named_mhi_contract(code):
+                continue
+            leg = self.ensure_leg(code)
+            apply_broker_position(broker, leg.position, leg.strategy, bootstrap=True)
+            leg.strategy.on_broker_position_opened()
         self.sync_entry_armed()
         self._sync_risk_shares(risk)
+        for code, broker in by_code.items():
+            self._last_broker_contracts[code.upper()] = broker.contracts
 
     def _entry_broker_sync_codes(self) -> list[str]:
-        """Broker month codes that may hold the entry book during rollover."""
+        """Priority order for which broker month row maps to the entry book."""
         codes: list[str] = []
         rollover = self.entry_rollover
         if rollover is not None and rollover.busy():
@@ -288,13 +388,13 @@ class MHIPortfolio:
                 codes.append(st.target_contract)
             if st.phase == "close" and st.held_contract:
                 codes.append(st.held_contract)
-        if self.front_contract and is_named_mhi_contract(self.front_contract):
-            codes.append(self.front_contract)
         if self.entry_position.contracts != 0 and self.entry_book_code:
             codes.append(self.entry_book_code)
         resolved = self.resolve_entry_order_code(self.front_contract)
         if resolved:
             codes.append(resolved)
+        if self.front_contract and is_named_mhi_contract(self.front_contract):
+            codes.append(self.front_contract)
         seen: set[str] = set()
         out: list[str] = []
         for code in codes:
@@ -308,29 +408,39 @@ class MHIPortfolio:
         self,
         by_code: dict[str, BrokerPosition],
         risk: Any,
-    ) -> list[str]:
-        changed: list[str] = []
-        sync_codes = self._entry_broker_sync_codes()
-        matched = next((c for c in sync_codes if c in by_code), None)
+    ) -> list[BrokerPositionChange]:
+        changed: list[BrokerPositionChange] = []
+        matched = self._resolve_entry_matched(by_code)
         if matched is not None:
             self._drop_leg_if_any(matched)
+            broker = by_code[matched]
             if refresh_broker_position(
-                by_code[matched],
+                broker,
                 self.entry_position,
                 self.entry_strategy,
                 risk,
                 cfg=self.cfg,
                 update_risk=False,
-            ):
-                changed.append(matched)
+            ) and self._broker_contracts_reportable(matched, broker.contracts):
+                changed.append(
+                    BrokerPositionChange(
+                        matched, "entry", self.entry_position.contracts,
+                    )
+                )
             self._note_entry_book_code(
                 matched if self.entry_position.contracts != 0 else None
             )
             return changed
-        entry_code = sync_codes[0] if sync_codes else self.managed_entry_code()
+        entry_code = self.entry_book_code or self.entry_held_code()
+        if not entry_code:
+            sync_codes = self._entry_broker_sync_codes()
+            entry_code = sync_codes[0] if sync_codes else self.managed_entry_code()
         if not entry_code:
             return changed
-        if self.entry_position.contracts != 0:
+        if (
+            self.entry_position.contracts != 0
+            and self._broker_row_missing(entry_code, by_code)
+        ):
             flat = BrokerPosition(
                 code=entry_code,
                 contracts=0,
@@ -348,60 +458,73 @@ class MHIPortfolio:
                 cfg=self.cfg,
                 update_risk=False,
             ):
-                changed.append(entry_code)
+                self._note_broker_contracts(entry_code, 0)
+                changed.append(
+                    BrokerPositionChange(entry_code, "entry", 0),
+                )
             self._note_entry_book_code(None)
         return changed
+
+    def _sync_leg_flat_if_broker_gone(
+        self,
+        code: str,
+        by_code: dict[str, BrokerPosition],
+        risk: Any,
+    ) -> BrokerPositionChange | None:
+        leg = self.legs.get(code)
+        if leg is None or leg.position.contracts == 0:
+            return None
+        if not self._broker_row_missing(code, by_code):
+            return None
+        flat = BrokerPosition(
+            code=code,
+            contracts=0,
+            qty=0,
+            entry_price=None,
+            current_price=None,
+            pnl_points=0.0,
+            pnl_val=None,
+        )
+        if not refresh_broker_position(
+            flat, leg.position, leg.strategy, risk, cfg=self.cfg, update_risk=False
+        ):
+            return None
+        self._note_broker_contracts(code, 0)
+        return BrokerPositionChange(code, "leg", 0)
 
     def refresh_from_broker(
         self,
         broker_legs: list[BrokerPosition],
         risk: Any,
-    ) -> list[str]:
-        """Sync front month to entry book; next-month legs flat-only."""
+    ) -> list[BrokerPositionChange]:
+        """Sync entry book and manual month legs from broker positions."""
         by_code = {
             b.code: b
             for b in broker_legs
             if b.contracts != 0 and is_hk_mhi_product_code(b.code)
         }
         changed = self._refresh_front_entry(by_code, risk)
+        entry_code = self.entry_book_code_active()
 
         for code, broker in by_code.items():
-            if self.tracks_on_entry_book(code):
+            if entry_code and code.upper() == entry_code.upper():
                 continue
-            if not self.tracks_as_next_month_leg(code):
+            if not is_named_mhi_contract(code):
                 continue
             leg = self.ensure_leg(code)
             if refresh_broker_position(
                 broker, leg.position, leg.strategy, risk, cfg=self.cfg, update_risk=False
-            ):
-                changed.append(code)
-                LOG.warning(
-                    "broker leg changed",
-                    extra={
-                        "event": "position_refresh",
-                        "contract": code,
-                        "contracts": leg.position.contracts,
-                    },
+            ) and self._broker_contracts_reportable(code, broker.contracts):
+                changed.append(
+                    BrokerPositionChange(code, "leg", leg.position.contracts),
                 )
 
         for code in list(self.legs.keys()):
-            if code not in by_code:
-                leg = self.legs[code]
-                if leg.position.contracts != 0:
-                    flat = BrokerPosition(
-                        code=code,
-                        contracts=0,
-                        qty=0,
-                        entry_price=None,
-                        current_price=None,
-                        pnl_points=0.0,
-                        pnl_val=None,
-                    )
-                    if refresh_broker_position(
-                        flat, leg.position, leg.strategy, risk, cfg=self.cfg, update_risk=False
-                    ):
-                        changed.append(code)
-                self.remove_if_flat(code)
+            if code in by_code:
+                continue
+            leg_change = self._sync_leg_flat_if_broker_gone(code, by_code, risk)
+            if leg_change is not None:
+                changed.append(leg_change)
 
         self.sync_entry_armed()
         self._sync_risk_shares(risk)

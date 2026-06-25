@@ -98,70 +98,31 @@ class QuoteClient:
         return True, float(closes.tail(period).mean())
 
     def resolve_front_contract(self, symbol: str) -> tuple[bool, str | None]:
-        """Map HK.MHImain to the HKEX spot month (nearest last-trading-day still live)."""
+        """Map HK.MHImain to HKEX spot month (local calendar; no OpenD per call)."""
         sym = str(symbol).upper()
         if sym != "HK.MHIMAIN":
             return True, symbol
 
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
+        from robs.execution.contract_rollover import HKEXMHISpot
 
-        from futu import RET_OK, SecurityReferenceType
+        spot = HKEXMHISpot.resolve()
+        if spot is None:
+            return False, None
+        return True, spot.front
 
-        from robs.execution.contract_rollover import (
-            is_named_mhi_contract,
-            pick_hkex_front_month,
-        )
+    def seed_mhi_ltd_overrides(self, codes: list[str]) -> dict[str, Any]:
+        """One-shot OpenD fetch of last-trade dates for calendar refinement at startup."""
+        from robs.execution.contract_rollover import parse_last_trade_date
 
-        contracts: list[tuple[str, str | None]] = []
-        ret, data = self._ctx.get_referencestock_list(symbol, SecurityReferenceType.FUTURE)
-        if ret == RET_OK and data is not None and len(data) > 0:
-            time_col = (
-                "future_last_trade_time"
-                if "future_last_trade_time" in data.columns
-                else "last_trade_time"
-            )
-            for _, row in data.iterrows():
-                code = str(row.get("code", ""))
-                if not is_named_mhi_contract(code):
-                    continue
-                contracts.append((code, str(row.get(time_col, "") or "")))
-
-        front = pick_hkex_front_month(contracts, now=datetime.now(ZoneInfo("Asia/Hong_Kong")))
-        if front:
-            return True, front
-
-        return self._resolve_front_from_candidates()
-
-    def _resolve_front_from_candidates(self) -> tuple[bool, str | None]:
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-
-        from futu import RET_OK
-
-        from robs.execution.contract_rollover import pick_hkex_front_month
-
-        now_hk = datetime.now(ZoneInfo("Asia/Hong_Kong"))
-        year = now_hk.year % 100
-        month = now_hk.month
-        candidates: list[str] = []
-        m, y = month, year
-        for _ in range(8):
-            candidates.append(f"HK.MHI{y:02d}{m:02d}")
-            m += 1
-            if m > 12:
-                m = 1
-                y += 1
-
-        contracts: list[tuple[str, str | None]] = []
-        for code in candidates:
-            ret, data = self._ctx.get_future_info(code)
-            if ret != RET_OK or data is None or len(data) == 0:
+        overrides: dict[str, Any] = {}
+        for code in codes:
+            ltd = self.contract_last_trade_time(code)
+            if not ltd:
                 continue
-            contracts.append((code, str(data.iloc[0].get("last_trade_time", "") or "")))
-
-        front = pick_hkex_front_month(contracts, now=now_hk)
-        return (front is not None), front
+            day = parse_last_trade_date(ltd)
+            if day is not None:
+                overrides[code] = day
+        return overrides
 
     def contract_last_trade_time(self, code: str) -> str | None:
         from futu import RET_OK

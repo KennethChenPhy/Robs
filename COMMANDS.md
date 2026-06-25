@@ -231,6 +231,7 @@ logging:
 | `data.poll_interval_sec` | `1` |
 | `risk.stale_poll_multiplier` | `30` (poll gap + data_time threshold) |
 | `risk.max_daily_loss_pct` | `50` |
+| `risk.max_position_shares` | `8` (net contracts across entry + legs) |
 | `logging.format` | `json` or `text` |
 | `logging.level` | `INFO` |
 | `logging.file` | `logs/mhimain.jsonl` |

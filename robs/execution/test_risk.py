@@ -68,5 +68,52 @@ class DailyLossKillSwitchTests(unittest.TestCase):
         self.assertTrue(risk.check_stale(old, 1.0))
 
 
+class ApproveOrderTests(unittest.TestCase):
+    def test_blocks_open_that_exceeds_max(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 0
+        ok, reason = risk.approve_order("BUY", 5)
+        self.assertFalse(ok)
+        self.assertIn("exceeds max", reason)
+
+    def test_allows_close_when_above_max(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 16
+        ok, reason = risk.approve_order("SELL", 9)
+        self.assertTrue(ok)
+        self.assertEqual(reason, "ok")
+
+    def test_allows_partial_close_above_max(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 7
+        ok, _ = risk.approve_order("SELL", 7)
+        self.assertTrue(ok)
+
+    def test_blocks_add_when_already_above_max(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 7
+        ok, reason = risk.approve_order("BUY", 1)
+        self.assertFalse(ok)
+        self.assertIn("exceeds max", reason)
+
+    def test_allows_cover_short(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = -10
+        ok, _ = risk.approve_order("BUY", 3)
+        self.assertTrue(ok)
+
+    def test_allows_cover_when_portfolio_net_wrong_but_unit_short(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 6
+        ok, reason = risk.approve_order("BUY", 6, unit_contracts=-6)
+        self.assertTrue(ok, reason)
+
+    def test_allows_partial_cover_when_net_mis_signed(self) -> None:
+        risk = RiskManager({"risk": {"max_position_shares": 4}})
+        risk.position_shares = 6
+        ok, reason = risk.approve_order("BUY", 3, unit_contracts=-6)
+        self.assertTrue(ok, reason)
+
+
 if __name__ == "__main__":
     unittest.main()

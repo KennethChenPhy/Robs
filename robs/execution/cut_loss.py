@@ -35,12 +35,12 @@ class PositionPnLBaseline:
         return 0.0
 
     def bootstrap(self, entry_price: float, current_price: float, position: int) -> None:
-        """Set baseline to current broker P/L at script start."""
+        """Startup only: cut/take are ±pts from launch P/L (current vs entry)."""
+        self.session_accum_pnl_pts = 0.0
         self.baseline_pnl_pts = self.pnl_points(entry_price, current_price, position)
-        self.session_accum_pnl_pts = self.baseline_pnl_pts
 
     def reset_on_new_entry(self) -> None:
-        """New position opened this session — baseline is flat P/L (session accum unchanged)."""
+        """Bot fill or manual open while running — baseline is entry (flat P/L)."""
         self.baseline_pnl_pts = 0.0
 
     def realize_on_close(self, entry_price: float, exit_price: float, position: int) -> float:

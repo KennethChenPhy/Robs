@@ -19,7 +19,7 @@ class RiskManager:
 
     @property
     def max_position(self) -> int:
-        return int(self.cfg.get("risk", {}).get("max_position_shares", 1000))
+        return int(self.cfg.get("risk", {}).get("max_position_shares", 8))
 
     @property
     def max_daily_loss_pct(self) -> float:
@@ -55,18 +55,52 @@ class RiskManager:
         age = (datetime.now(timezone.utc) - last_poll_at).total_seconds()
         return age > interval_sec * multiplier
 
-    def approve_order(self, side: str, qty: int) -> tuple[bool, str]:
+    def approve_order(
+        self,
+        side: str,
+        qty: int,
+        *,
+        unit_contracts: int | None = None,
+    ) -> tuple[bool, str]:
         if self.killed:
             return False, self.kill_reason or "kill switch active"
 
         if qty <= 0:
             return False, "qty must be positive"
 
-        projected = self.position_shares + qty if side.upper() == "BUY" else self.position_shares - qty
+        side_up = side.upper()
+        net = self.position_shares
+
+        if unit_contracts is not None:
+            u = int(unit_contracts)
+            unit_after = u + qty if side_up == "BUY" else u - qty
+            if abs(unit_after) < abs(u):
+                return True, "ok"
+            projected = net - u + unit_after
+            if abs(projected) > self.max_position:
+                return False, f"position {projected} exceeds max {self.max_position}"
+            return True, "ok"
+
+        if self._is_reducing_exposure(side):
+            return True, "ok"
+
+        projected = net + qty if side_up == "BUY" else net - qty
         if abs(projected) > self.max_position:
             return False, f"position {projected} exceeds max {self.max_position}"
 
         return True, "ok"
+
+    def _is_reducing_exposure(self, side: str) -> bool:
+        """True when the order closes or covers existing net exposure (always allowed)."""
+        net = self.position_shares
+        if net == 0:
+            return False
+        side_up = side.upper()
+        if net > 0 and side_up == "SELL":
+            return True
+        if net < 0 and side_up == "BUY":
+            return True
+        return False
 
     def on_fill(self, side: str, qty: int) -> None:
         if side.upper() == "BUY":

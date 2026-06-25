@@ -4,14 +4,39 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+HK = ZoneInfo("Asia/Hong_Kong")
+LOG_TS_FMT = "%Y-%m-%dT%H:%M:%S"
+_POLL_LINE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} MHI")
 
 _LOG_RECORD_SKIP = frozenset(
     logging.LogRecord("", 0, "", 0, "", (), None, None).__dict__
-) | {"message", "asctime", "msg", "args"}
+) | {"message", "asctime", "msg", "args", "quote_ts"}
+
+
+def is_poll_log_message(message: str) -> bool:
+    return bool(_POLL_LINE_RE.match(message.strip()))
+
+
+def format_hk_log_ts(when: datetime | None = None) -> str:
+    """HK local time as YYYY-MM-DDTHH:MM:SS."""
+    dt = when or datetime.now(HK)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=HK)
+    else:
+        dt = dt.astimezone(HK)
+    return dt.strftime(LOG_TS_FMT)
+
+
+def format_hk_compact_ts(when: datetime | None = None) -> str:
+    """Alias for format_hk_log_ts (legacy name)."""
+    return format_hk_log_ts(when)
 
 
 class StructuredFormatter(logging.Formatter):
@@ -21,21 +46,36 @@ class StructuredFormatter(logging.Formatter):
         super().__init__()
         self.style = style
 
+    def _is_poll(self, record: logging.LogRecord, fields: dict[str, Any], message: str) -> bool:
+        return (
+            fields.get("event") == "poll"
+            or getattr(record, "event", None) == "poll"
+            or is_poll_log_message(message)
+        )
+
     def format(self, record: logging.LogRecord) -> str:
-        ts = datetime.fromtimestamp(record.created, tz=timezone.utc).isoformat()
         fields: dict[str, Any] = {
             k: v
             for k, v in record.__dict__.items()
             if k not in _LOG_RECORD_SKIP and v is not None and not k.startswith("_")
         }
         message = record.getMessage()
+        is_poll = self._is_poll(record, fields, message)
+        if is_poll:
+            fields.pop("event", None)
         if self.style == "text":
+            if is_poll:
+                return message
+            ts = format_hk_log_ts(datetime.fromtimestamp(record.created, tz=HK))
             parts = [f"ts={ts}", f"level={record.levelname}", f"logger={record.name}"]
             for key in sorted(fields):
                 parts.append(f"{key}={fields[key]}")
             parts.append(f"msg={message}")
             return " ".join(parts)
-        payload = {
+        if is_poll:
+            return json.dumps({"poll": message}, ensure_ascii=False)
+        ts = format_hk_log_ts(datetime.fromtimestamp(record.created, tz=HK))
+        payload: dict[str, Any] = {
             "ts": ts,
             "level": record.levelname,
             "logger": record.name,

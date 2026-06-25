@@ -271,7 +271,7 @@ After fills in portfolio mode, `portfolio._sync_risk_shares(risk)` keeps `risk.p
 | Stale quotes | `stale_poll_multiplier: 30` × poll interval | Block new entries |
 | Trade unlock | `trd_env: SIMULATE` / REAL | REAL needs password; expiry → flatten |
 | Position refresh | `position_refresh_sec: 2` | Broker sync + snapshots |
-| Position cap | `max_position_shares: 8` (in code) | `approve_order()` before submit |
+| Position cap | `risk.max_position_shares: 8` | `approve_order()` before submit |
 
 ---
 

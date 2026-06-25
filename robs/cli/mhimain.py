@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -22,16 +23,23 @@ from robs.execution.alarm import play_panic_alarm
 from robs.execution.contract_rollover import (
     ContractRolloverManager,
     HK,
+    HKEXFrontCalendar,
+    HKEXMHISpot,
     contract_log_label,
+    hkex_spot_startup_message,
     is_continuous_mhi,
-    is_held_ahead_of_front,
     is_ltd_expiring_month_open_banned,
     is_named_mhi_contract,
+    local_contract_last_trade_time,
     resolve_rollover_target,
     should_rollover,
 )
 from robs.execution.market_guard import allow_market_order
-from robs.execution.mhi_portfolio import MHIPortfolio, parse_quote_batch
+from robs.execution.mhi_portfolio import (
+    BrokerPositionChange,
+    MHIPortfolio,
+    parse_quote_batch,
+)
 from robs.execution.order_gate import OrderGate
 from robs.execution.position import UnitPositionBook
 from robs.execution.position_sync import fetch_broker_mhi_legs, live_pnl_points
@@ -39,6 +47,7 @@ from robs.execution.quote_staleness import (
     QuoteFreshness,
     assess_quote_freshness,
     is_new_entry,
+    parse_quote_data_time,
     stale_threshold_sec,
 )
 from robs.execution.risk import RiskManager
@@ -47,7 +56,7 @@ from robs.execution.trade_unlock import (
     maybe_create_unlock_session,
     warn_short_trade_unlock_window,
 )
-from robs.log_config import setup_logging
+from robs.log_config import format_hk_log_ts, setup_logging
 from robs.strategy.mhimain import MHImainStrategy
 from robs.strategy.rules import Action, Signal
 from robs.strategy.trend import TrendMode, prompt_trend_mode
@@ -57,17 +66,71 @@ LOG = logging.getLogger("robs.mhimain")
 
 def _sync_front_context(
     portfolio: MHIPortfolio,
-    quote: QuoteClient,
     symbol: str,
-    front_contract: str | None,
+    spot: HKEXMHISpot | None,
 ) -> None:
-    if is_continuous_mhi(symbol) and front_contract:
-        ltd = quote.contract_last_trade_time(front_contract)
-        if ltd is None and portfolio.front_last_trade_time:
-            ltd = portfolio.front_last_trade_time
-        portfolio.update_front_context(front_contract, ltd)
+    if is_continuous_mhi(symbol) and spot:
+        portfolio.update_front_context(spot.front, spot.front_ltd)
     else:
         portfolio.update_front_context(None, None)
+
+
+def _seed_hkex_calendar_ltd(quote: QuoteClient, calendar: HKEXFrontCalendar) -> None:
+    """One OpenD fetch at startup for front+next LTD; calendar handles the rest."""
+    spot = calendar.spot()
+    if not spot:
+        return
+    raw = quote.seed_mhi_ltd_overrides([spot.front, spot.next])
+    overrides = {k: v for k, v in raw.items() if isinstance(v, date)}
+    if overrides:
+        calendar.merge_ltd_overrides(overrides)
+        LOG.info(
+            "HKEX calendar LTD seeded from OpenD",
+            extra={
+                "event": "contract_rollover",
+                "codes": list(overrides.keys()),
+            },
+        )
+
+
+def _log_hkex_calendar(spot: HKEXMHISpot) -> None:
+    msg = hkex_spot_startup_message(spot)
+    LOG.info(
+        msg,
+        extra={
+            "event": "contract_rollover",
+            "front_contract": spot.front,
+            "next_contract": spot.next,
+            "front_ltd": spot.front_ltd,
+            "next_ltd": spot.next_ltd,
+        },
+    )
+
+
+def _refresh_hkex_spot_if_changed(
+    quote: QuoteClient,
+    calendar: HKEXFrontCalendar,
+    last_key: tuple[str, str] | None,
+    *,
+    seed_ltd: bool = False,
+) -> tuple[HKEXMHISpot | None, tuple[str, str] | None]:
+    """Resolve spot; log calendar line when front/next changes (e.g. after LTD flip)."""
+    if seed_ltd:
+        _seed_hkex_calendar_ltd(quote, calendar)
+    spot = calendar.spot()
+    if spot is None:
+        return None, last_key
+    key = (spot.front, spot.next)
+    if key == last_key:
+        return spot, last_key
+    if last_key is not None:
+        _seed_hkex_calendar_ltd(quote, calendar)
+        spot = calendar.spot()
+        if spot is None:
+            return None, key
+        key = (spot.front, spot.next)
+    _log_hkex_calendar(spot)
+    return spot, key
 
 
 @dataclass
@@ -88,53 +151,6 @@ class _StaleLogGate:
 
 
 _stale_log_gate = _StaleLogGate()
-
-
-@dataclass
-class _RolloverSkipGate:
-    """Emit at most one rollover-skip notice per (held, front, reason) episode."""
-
-    _last: str | None = None
-
-    def should_log(self, key: str) -> bool:
-        if key == self._last:
-            return False
-        self._last = key
-        return True
-
-    def reset(self) -> None:
-        self._last = None
-
-
-_rollover_skip_gate = _RolloverSkipGate()
-
-
-def _log_rollover_skip(
-    held: str,
-    front: str | None,
-    *,
-    reason: str,
-    last_trade_time: str | None = None,
-) -> None:
-    front_label = contract_log_label(front) if front else "?"
-    key = f"{held}|{front}|{reason}"
-    if not _rollover_skip_gate.should_log(key):
-        return
-    held_label = contract_log_label(held)
-    if reason == "held_ahead_of_front":
-        msg = f"rollover skipped: held {held_label} ahead of front {front_label}"
-    else:
-        msg = f"rollover skipped: {reason}"
-    LOG.info(
-        msg,
-        extra={
-            "event": "rollover_skipped",
-            "reason": reason,
-            "held_contract": held,
-            "front_contract": front,
-            "last_trade_time": last_trade_time,
-        },
-    )
 
 
 def _log_quote_stale(fresh: QuoteFreshness, *, event: str = "quote_stale") -> None:
@@ -206,6 +222,7 @@ def _order_line(
     contract: str | None = None,
     pos_after: int | None = None,
     cum_pnl: float | None = None,
+    compact_fill: bool = False,
 ) -> str:
     q = int(qty)
     contract_tag = f" {contract_log_label(contract)}" if contract else ""
@@ -214,15 +231,21 @@ def _order_line(
         if "market blocked" in reason:
             text = f"{side} x{q}{contract_tag} blocked (slippage)"
         else:
-            text = f"{side} x{q}{contract_tag} rejected"
+            short = reason if len(reason) <= 60 else reason[:57] + "..."
+            text = f"{side} x{q}{contract_tag} rejected: {short}"
     elif result.get("filled") or result.get("status", "").upper().startswith("FILLED"):
-        text = f"{side} x{q}{contract_tag} filled @ {price:.0f}"
+        if compact_fill:
+            oid = result.get("order_id")
+            oid_tag = f" #{oid}" if oid else ""
+            text = f"filled{oid_tag} @ {price:.0f}"
+        else:
+            text = f"{side} x{q}{contract_tag} filled @ {price:.0f}"
     else:
         oid = result.get("order_id") or "?"
         text = f"{side} x{q}{contract_tag} pending #{oid}"
     if pos_after is not None:
         text += f" → pos={pos_after:+d}"
-    if cum_pnl is not None:
+    if cum_pnl is not None and not compact_fill:
         text += f" | cum {cum_pnl:+.0f}pts"
     return text
 
@@ -236,6 +259,7 @@ def _log_order(
     contract: str | None = None,
     pos_after: int | None = None,
     cum_pnl: float | None = None,
+    compact_fill: bool = False,
 ) -> None:
     LOG.info(
         _order_line(
@@ -243,6 +267,7 @@ def _log_order(
             contract=contract,
             pos_after=pos_after,
             cum_pnl=cum_pnl,
+            compact_fill=compact_fill,
         ),
         extra={
             "event": "order",
@@ -260,25 +285,380 @@ def _log_order(
 
 
 @dataclass
-class PollDisplayGate:
-    """Only emit status lines when price moves threshold pts from last shown quote."""
-
-    threshold_pts: float
+class _PollLegState:
     ref_price: float | None = None
     total_change: float = 0.0
 
-    def note_price(self, price: float | None) -> tuple[bool, float]:
-        if price is None:
+
+@dataclass
+class PollDisplayGate:
+    """Per-contract poll gates: emit when any tracked code moves threshold pts."""
+
+    threshold_pts: float
+    _legs: dict[str, _PollLegState] = field(default_factory=dict)
+
+    def seed(self, code: str, price: float) -> None:
+        leg = self._legs.setdefault(code, _PollLegState())
+        if leg.ref_price is None:
+            leg.ref_price = price
+
+    def note_prices(
+        self,
+        prices: dict[str, float],
+        codes: list[str],
+    ) -> tuple[bool, dict[str, float], dict[str, float]]:
+        """Update all tracked codes; return True if any crossed the threshold."""
+        triggered = False
+        diffs: dict[str, float] = {}
+        totals: dict[str, float] = {}
+        for code in codes:
+            px = prices.get(code)
+            if px is None:
+                continue
+            show, diff = self._note_one(code, float(px))
+            if show:
+                triggered = True
+                diffs[code] = diff
+                totals[code] = self._legs[code].total_change
+        return triggered, diffs, totals
+
+    def _note_one(self, code: str, price: float) -> tuple[bool, float]:
+        leg = self._legs.setdefault(code, _PollLegState())
+        if leg.ref_price is None:
+            leg.ref_price = price
             return False, 0.0
-        if self.ref_price is None:
-            self.ref_price = price
-            return False, 0.0
-        diff = price - self.ref_price
+        diff = price - leg.ref_price
         if abs(diff) < self.threshold_pts:
             return False, diff
-        self.total_change += diff
-        self.ref_price = price
+        leg.total_change += diff
+        leg.ref_price = price
         return True, diff
+
+
+def _poll_display_codes(portfolio: MHIPortfolio, quote_symbol: str) -> list[str]:
+    """MHImain plus broker front and each named month we quote."""
+    codes = [quote_symbol]
+    front = portfolio.front_contract
+    if front and is_named_mhi_contract(front) and front not in codes:
+        codes.append(front)
+    for code in portfolio._quoted_month_codes():
+        if code not in codes:
+            codes.append(code)
+    return codes
+
+
+def _resolve_contract_poll_price(
+    prices: dict[str, float],
+    code: str,
+    quote_symbol: str,
+    front_contract: str | None,
+) -> float | None:
+    """Price for poll display; front month may use MHImain when only continuous is quoted."""
+    if code in prices:
+        return float(prices[code])
+    if (
+        is_named_mhi_contract(code)
+        and front_contract
+        and code.upper() == front_contract.upper()
+        and quote_symbol in prices
+    ):
+        return float(prices[quote_symbol])
+    if is_named_mhi_contract(code):
+        return None
+    return prices.get(quote_symbol)
+
+
+def _poll_prices_for_display(
+    prices: dict[str, float],
+    quote_symbol: str,
+    portfolio: MHIPortfolio,
+    codes: list[str],
+) -> dict[str, float]:
+    front = portfolio.front_contract
+    out = dict(prices)
+    for code in codes:
+        if code in out:
+            continue
+        px = _resolve_contract_poll_price(prices, code, quote_symbol, front)
+        if px is not None:
+            out[code] = px
+    return out
+
+
+def _poll_update_time(
+    data_times: dict[str, str],
+    quote_symbol: str,
+    portfolio: MHIPortfolio,
+) -> str:
+    """Prefer quote data_time from front month, then MHImain."""
+    front = portfolio.front_contract
+    if front and data_times.get(front):
+        return data_times[front]
+    if data_times.get(quote_symbol):
+        return data_times[quote_symbol]
+    for code in portfolio._quoted_month_codes():
+        if data_times.get(code):
+            return data_times[code]
+    return ""
+
+
+def _poll_contract_short(code: str | None) -> str:
+    """MHImain → main, HK.MHI2606 / MHI2606 → 2606."""
+    if not code:
+        return "?"
+    label = contract_log_label(code)
+    if label == "MHImain":
+        return "main"
+    if label.startswith("MHI") and label != "MHImain":
+        return label[3:]
+    return label
+
+
+def _extract_bracket_tags(status: str) -> tuple[str, str]:
+    core = status.strip()
+    tags = "".join(re.findall(r" \[[^\]]+\]", core))
+    core = re.sub(r" \[[^\]]+\]", "", core).strip()
+    return core, tags
+
+
+def _compact_poll_signal(status: str) -> str:
+    """Short poll action line; bracket tags (COOLDOWN, etc.) preserved at end."""
+    core, tags = _extract_bracket_tags(status)
+    if not core:
+        return tags.strip()
+
+    if " FLAT: take profit" in core:
+        leg, rest = core.split(" FLAT: take profit", 1)
+        leg_s = _poll_contract_short(leg.strip())
+        now_m = re.search(r"\(now ([+-]?\d+)", rest)
+        pts = now_m.group(1) if now_m else ""
+        return f"{leg_s} TP {pts}{tags}" if pts else f"{leg_s} TP{tags}"
+
+    if " FLAT: cut loss" in core:
+        leg, rest = core.split(" FLAT: cut loss", 1)
+        leg_s = _poll_contract_short(leg.strip())
+        now_m = re.search(r"\(now ([+-]?\d+)", rest)
+        pts = now_m.group(1) if now_m else ""
+        return f"{leg_s} cut {pts}{tags}" if pts else f"{leg_s} cut{tags}"
+
+    for action in ("BUY", "SELL", "FLAT"):
+        token = f" {action}:"
+        if token in core:
+            leg, reason = core.split(token, 1)
+            leg_s = _poll_contract_short(leg.strip())
+            short_reason = reason.strip().split(" (", 1)[0]
+            if len(short_reason) > 48:
+                short_reason = short_reason[:45] + "..."
+            return f"{leg_s} {action} {short_reason}{tags}"
+
+    if core.startswith("holding "):
+        return f"hold{tags}"
+
+    if core.startswith("flat, waiting entry"):
+        return f"wait entry{tags}"
+
+    if core == "flat":
+        return f"flat{tags}"
+
+    if core == "order pending":
+        return f"wait fill{tags}"
+
+    compact = _compact_signal(core)
+    return f"{compact}{tags}" if compact else tags.strip()
+
+
+def _format_poll_move(diffs: dict[str, float] | None, code: str) -> str:
+    if not diffs or code not in diffs:
+        return ""
+    return f"Δ{diffs[code]:+.0f}"
+
+
+def _status_contract_code(status: str) -> str | None:
+    core, _ = _extract_bracket_tags(status)
+    m = re.match(r"^(MHI\w+)", core.strip())
+    if not m:
+        return None
+    label = m.group(1)
+    if label == "MHImain":
+        return "HK.MHImain"
+    return f"HK.{label}"
+
+
+def _poll_signal_for_contract(status: str, contract_code: str, *, main_line: bool = False) -> str:
+    target = _status_contract_code(status)
+    if target is not None:
+        if target.upper() != contract_code.upper():
+            return ""
+    elif not main_line:
+        return ""
+    text = _compact_poll_signal(status)
+    return text
+
+
+def _has_next_month_contracts(portfolio: MHIPortfolio) -> bool:
+    if portfolio.entry_position.contracts != 0:
+        if portfolio.is_next_month_code(portfolio.managed_entry_code()):
+            return True
+    return any(
+        leg.position.contracts != 0 for leg in portfolio.ahead_of_front_legs()
+    )
+
+
+def _next_month_poll_code(portfolio: MHIPortfolio) -> str | None:
+    if not _has_next_month_contracts(portfolio):
+        return None
+    for leg in portfolio.ahead_of_front_legs():
+        if leg.position.contracts != 0:
+            return leg.code
+    entry_code = portfolio.managed_entry_code()
+    if portfolio.entry_position.contracts != 0 and portfolio.is_next_month_code(entry_code):
+        return entry_code
+    return None
+
+
+def _poll_contract_context(
+    portfolio: MHIPortfolio,
+    code: str,
+) -> tuple[MHImainStrategy, UnitPositionBook, bool]:
+    """Strategy, position, and watch flag for one poll row."""
+    entry_code = (
+        portfolio.managed_entry_code()
+        if portfolio.entry_position.contracts != 0
+        else None
+    )
+    if entry_code and code.upper() == entry_code.upper():
+        return (
+            portfolio.entry_strategy,
+            portfolio.entry_position,
+            portfolio.entry_position.contracts == 0,
+        )
+    leg = portfolio.leg_for_code(code)
+    if leg is not None and leg.position.contracts != 0:
+        return leg.strategy, leg.position, False
+    return portfolio.entry_strategy, portfolio.entry_position, True
+
+
+def _poll_month_label(code: str) -> str:
+    """HK.MHI2606 → MHI2606, HK.MHImain → MHImain."""
+    return contract_log_label(code) or "?"
+
+
+def _front_month_poll_code(portfolio: MHIPortfolio, quote_symbol: str) -> str:
+    if portfolio.entry_position.contracts != 0:
+        entry_code = portfolio.managed_entry_code()
+        if not portfolio.is_next_month_code(entry_code):
+            return entry_code
+    front = portfolio.front_contract
+    if front and is_named_mhi_contract(front):
+        return front
+    return quote_symbol
+
+
+def _poll_exit_prices(strategy: MHImainStrategy, position_sign: int) -> tuple[str, str]:
+    """Cut-loss and take-profit price levels from entry and config."""
+    entry = strategy.entry_price
+    if entry is None or position_sign == 0:
+        return "-", "-"
+    bl = strategy.pnl_baseline
+    cut_pnl = bl.cut_loss_trigger()
+    tp_pnl = bl.take_profit_trigger()
+    if position_sign > 0:
+        cut_px = entry + cut_pnl
+        tp_px = entry + tp_pnl
+    else:
+        cut_px = entry - cut_pnl
+        tp_px = entry - tp_pnl
+    return f"{cut_px:.0f}", f"{tp_px:.0f}"
+
+
+def _format_poll_contract_pl_line(
+    code: str,
+    strategy: MHImainStrategy,
+    position: UnitPositionBook,
+    prices: dict[str, float],
+    quote_symbol: str,
+    main_px: float | None,
+    *,
+    front_contract: str | None = None,
+    watch: bool = False,
+) -> str:
+    """MHIyymm entry, current, P/L, cut-loss price, take-profit price."""
+    label = _poll_month_label(code)
+    px = _resolve_contract_poll_price(prices, code, quote_symbol, front_contract)
+    if px is None and not is_named_mhi_contract(code):
+        px = main_px
+    current_s = f"{px:.0f}" if px is not None else "-"
+
+    if watch or position.contracts == 0:
+        entry_s = "-"
+        pos_s = _position_label(0)
+        pnl_s = "0" if watch else "-"
+        cut_s, tp_s = "-", "-"
+    else:
+        entry = strategy.entry_price
+        entry_s = f"{entry:.0f}" if entry is not None else "-"
+        pos_s = _position_label(position.contracts)
+        pnl = live_pnl_points(strategy, position, px) if px is not None else None
+        pnl_s = f"{pnl:+.0f}" if pnl is not None else "-"
+        cut_s, tp_s = _poll_exit_prices(strategy, position.position)
+
+    return (
+        f"{label} ent {entry_s} {pos_s}, last {current_s}, pnl {pnl_s}, cut {cut_s}, tp {tp_s}"
+    )
+
+
+def _poll_log_ts(update_time: str | None) -> str:
+    """HK timestamp for poll logs (from quote data_time when available)."""
+    parsed = parse_quote_data_time(update_time or "")
+    if parsed is not None:
+        return format_hk_log_ts(parsed)
+    return format_hk_log_ts()
+
+
+def _build_poll_status_lines(
+    quote_symbol: str,
+    prices: dict[str, float],
+    portfolio: MHIPortfolio,
+    update_time: str | None,
+) -> list[str]:
+    del update_time
+    front_contract = portfolio.front_contract
+    main_px = prices.get(quote_symbol)
+    lines: list[str] = []
+
+    front_code = _front_month_poll_code(portfolio, quote_symbol)
+    strat, pos, watch = _poll_contract_context(portfolio, front_code)
+    lines.append(
+        _format_poll_contract_pl_line(
+            front_code,
+            strat,
+            pos,
+            prices,
+            quote_symbol,
+            main_px,
+            front_contract=front_contract,
+            watch=watch,
+        )
+    )
+
+    next_code = _next_month_poll_code(portfolio)
+    if next_code is None or next_code.upper() == front_code.upper():
+        return lines
+
+    strat, pos, watch = _poll_contract_context(portfolio, next_code)
+    lines.append(
+        _format_poll_contract_pl_line(
+            next_code,
+            strat,
+            pos,
+            prices,
+            quote_symbol,
+            main_px,
+            front_contract=front_contract,
+            watch=watch,
+        )
+    )
+    return lines
 
 
 def _process_signal(
@@ -315,15 +695,17 @@ def _process_signal(
             side = order_gate.side or "?"
             qty = int(order_gate.qty)
             contract = order_gate.order_code or trade_code
+            compact = order_gate.logged_submit
+            oid = order_gate.order_id
             _finalize_filled_order(strategy, risk, position, price, order_gate)
             _sync_portfolio_risk()
-            cum = _session_pnl_pts(strategy, position, price)
             _log_order(
                 side, qty, price,
-                {"ok": True, "filled": True, "status": "FILLED"},
+                {"ok": True, "filled": True, "status": "FILLED", "order_id": oid},
                 contract=contract,
                 pos_after=position.contracts,
-                cum_pnl=cum,
+                cum_pnl=None if compact else _session_pnl_pts(strategy, position, price),
+                compact_fill=compact,
             )
         elif outcome == "failed":
             LOG.warning("order cancelled — retry later", extra={"event": "order_cancelled"})
@@ -460,6 +842,7 @@ def _process_signal(
         contract=trade_code,
         cum_pnl=_session_pnl_pts(strategy, position, price),
     )
+    order_gate.logged_submit = True
 
 
 def _finalize_filled_order(
@@ -542,14 +925,16 @@ def _resolve_pending_close(
         side = order_gate.side or "?"
         qty = int(order_gate.qty)
         contract = order_gate.order_code or symbol
+        compact = order_gate.logged_submit
+        oid = order_gate.order_id
         _finalize_filled_order(strategy, risk, position, price, order_gate)
-        cum = _session_pnl_pts(strategy, position, price)
         _log_order(
             side, qty, price,
-            {"ok": True, "filled": True, "status": "FILLED"},
+            {"ok": True, "filled": True, "status": "FILLED", "order_id": oid},
             contract=contract,
             pos_after=position.contracts,
-            cum_pnl=cum,
+            cum_pnl=None if compact else _session_pnl_pts(strategy, position, price),
+            compact_fill=compact,
         )
     elif outcome == "failed":
         LOG.warning(on_failed, extra={"event": "close_cancelled"})
@@ -582,14 +967,16 @@ def _resolve_rollover_pending(
         side = order_gate.side or "?"
         qty = int(order_gate.qty)
         contract = order_gate.order_code or symbol
+        compact = order_gate.logged_submit
+        oid = order_gate.order_id
         _finalize_filled_order(strategy, risk, position, price, order_gate)
-        cum = _session_pnl_pts(strategy, position, price)
         _log_order(
             side, qty, price,
-            {"ok": True, "filled": True, "status": "FILLED"},
+            {"ok": True, "filled": True, "status": "FILLED", "order_id": oid},
             contract=contract,
             pos_after=position.contracts,
-            cum_pnl=cum,
+            cum_pnl=None if compact else _session_pnl_pts(strategy, position, price),
+            compact_fill=compact,
         )
         if rollover.state.phase == "close" and position.contracts == 0:
             rollover.advance_after_close(0)
@@ -664,6 +1051,7 @@ def _handle_contract_rollover(
     prices: dict[str, float] | None = None,
     rollover_open_skip: Callable[[str, int], bool] | None = None,
     on_rollover_open_skipped: Callable[[str, int], bool] | None = None,
+    ltd_overrides: dict[str, date] | None = None,
 ) -> bool:
     """Close expiring month and reopen on front month. Returns True to skip strategy."""
     if not rollover.active():
@@ -683,7 +1071,6 @@ def _handle_contract_rollover(
 
     if rollover.state.phase == "idle":
         if position.contracts == 0:
-            _rollover_skip_gate.reset()
             return False
         held = held_contract or rollover.state.held_contract
         if not held or not is_named_mhi_contract(held):
@@ -694,16 +1081,16 @@ def _handle_contract_rollover(
             last_trade_time,
             now=datetime.now(HK),
             on_last_trade_day=on_last,
+            ltd_overrides=ltd_overrides,
         )
         if not do_roll:
-            if front_contract and is_held_ahead_of_front(held, front_contract):
-                _log_rollover_skip(held, front_contract, reason="held_ahead_of_front")
             return False
         target = resolve_rollover_target(
             held,
             front_contract,
             last_trade_time=last_trade_time,
             now=datetime.now(HK),
+            ltd_overrides=ltd_overrides,
         )
         if not target:
             return False
@@ -822,15 +1209,58 @@ def _handle_contract_rollover(
     return False
 
 
+def _lookup_quote_row(rows: dict[str, Any], *keys: str) -> Any | None:
+    """First matching quote row; avoids `series or …` truthiness on pandas Series."""
+    for key in keys:
+        if key in rows:
+            return rows[key]
+    return None
+
+
+def _resolve_trade_price(
+    prices: dict[str, float],
+    code: str,
+    quote_symbol: str,
+    front_contract: str | None,
+) -> float | None:
+    """Trade price for a contract; None when no valid quote (never use 0)."""
+    px = _resolve_contract_poll_price(prices, code, quote_symbol, front_contract)
+    if px is None or px <= 0:
+        return None
+    return float(px)
+
+
+def _lookup_quote_price(prices: dict[str, float], *keys: str, default: float = 0.0) -> float:
+    for key in keys:
+        if key in prices:
+            return float(prices[key])
+    return default
+
+
 def _leg_trade_context(
     quote: QuoteClient,
     quote_symbol: str,
     leg_code: str,
     rows: dict[str, Any],
     prices: dict[str, float],
-) -> tuple[Any | None, float]:
-    row = rows.get(leg_code) or rows.get(quote_symbol)
-    price = float(prices.get(leg_code, prices.get(quote_symbol, 0.0)))
+    *,
+    front_contract: str | None = None,
+) -> tuple[Any | None, float | None]:
+    """Quote row/price for a named month; front month may use MHImain when only continuous is quoted."""
+    row = _lookup_quote_row(rows, leg_code)
+    price = _resolve_trade_price(prices, leg_code, quote_symbol, front_contract)
+    if is_named_mhi_contract(leg_code):
+        if row is None and price is not None and leg_code not in prices:
+            fallback_row = _lookup_quote_row(rows, quote_symbol)
+            if fallback_row is not None:
+                return _trade_row(quote, quote_symbol, fallback_row), price
+        if row is None:
+            return None, price
+        return _trade_row(quote, leg_code, row), price
+    if row is None:
+        row = _lookup_quote_row(rows, quote_symbol)
+    if price is None:
+        price = _resolve_trade_price(prices, quote_symbol, quote_symbol, front_contract)
     if row is None:
         return None, price
     return _trade_row(quote, leg_code, row), price
@@ -845,10 +1275,10 @@ def _flat_entry_context(
     prices: dict[str, float],
 ) -> tuple[UnitPositionBook, MHImainStrategy, str, Any | None, float, Any | None]:
     position, strategy, order_code = portfolio.flat_entry_target(front_contract)
-    row = rows.get(order_code) or rows.get(quote_symbol)
-    price = float(prices.get(order_code, prices.get(quote_symbol, 0.0)))
-    trade_row = _trade_row(quote, order_code, row) if row is not None else None
-    return position, strategy, order_code, trade_row, price, row
+    row, price = _leg_trade_context(quote, quote_symbol, order_code, rows, prices)
+    trade_row = row
+    raw_row = _lookup_quote_row(rows, order_code)
+    return position, strategy, order_code, trade_row, price, raw_row
 
 
 def _allows_next_month_close(position: UnitPositionBook, action: Action) -> bool:
@@ -1061,6 +1491,7 @@ def _handle_entry_book_rollover(
     trade_unlock: TradeUnlockSession | None,
     *,
     front_contract: str | None,
+    ltd_overrides: dict[str, date] | None = None,
 ) -> bool:
     """Roll the bot entry book. Returns True to skip entry strategy only."""
     rollover = portfolio.entry_rollover
@@ -1077,7 +1508,9 @@ def _handle_entry_book_rollover(
     if rollover.state.phase == "open" and rollover.state.target_contract:
         quote_code = rollover.state.target_contract
     row, price = _leg_trade_context(quote, quote_symbol, quote_code or quote_symbol, rows, prices)
-    last_trade_time = quote.contract_last_trade_time(held) if held else None
+    last_trade_time = (
+        local_contract_last_trade_time(held, ltd_overrides=ltd_overrides) if held else None
+    )
 
     def _note_entry_opened(code: str) -> None:
         portfolio._note_entry_book_code(code)
@@ -1103,6 +1536,7 @@ def _handle_entry_book_rollover(
         prices=prices,
         rollover_open_skip=_skip_open_if_ahead_leg,
         on_rollover_open_skipped=_absorb_ahead_leg,
+        ltd_overrides=ltd_overrides,
     )
 
 
@@ -1119,6 +1553,7 @@ def _handle_leg_rollovers(
     trade_unlock: TradeUnlockSession | None,
     *,
     front_contract: str | None,
+    ltd_overrides: dict[str, date] | None = None,
 ) -> bool:
     """Roll front-month legs. Returns True to skip all strategy signals."""
     for leg in sorted(portfolio.active_legs(), key=lambda lg: lg.code):
@@ -1127,7 +1562,7 @@ def _handle_leg_rollovers(
         if leg.rollover is None or not leg.rollover.active():
             continue
         row, price = _leg_trade_context(quote, quote_symbol, leg.code, rows, prices)
-        last_trade_time = quote.contract_last_trade_time(leg.code)
+        last_trade_time = local_contract_last_trade_time(leg.code, ltd_overrides=ltd_overrides)
         if _handle_contract_rollover(
             cfg, trade, quote, leg.position, leg.strategy, risk,
             quote_symbol, row, price, order_gate, trade_unlock,
@@ -1137,6 +1572,7 @@ def _handle_leg_rollovers(
             last_trade_time=last_trade_time,
             rows=rows,
             prices=prices,
+            ltd_overrides=ltd_overrides,
         ):
             return True
     return False
@@ -1155,17 +1591,20 @@ def _handle_portfolio_rollovers(
     trade_unlock: TradeUnlockSession | None,
     *,
     front_contract: str | None,
+    ltd_overrides: dict[str, date] | None = None,
 ) -> tuple[bool, bool]:
     """Returns (skip_entry_strategy, skip_all_strategy)."""
     entry_skip = _handle_entry_book_rollover(
         cfg, trade, quote, portfolio, risk, quote_symbol,
         rows, prices, order_gate, trade_unlock,
         front_contract=front_contract,
+        ltd_overrides=ltd_overrides,
     )
     leg_skip = _handle_leg_rollovers(
         cfg, trade, quote, portfolio, risk, quote_symbol,
         rows, prices, order_gate, trade_unlock,
         front_contract=front_contract,
+        ltd_overrides=ltd_overrides,
     )
     return entry_skip, leg_skip
 
@@ -1189,6 +1628,102 @@ def _portfolio_tags(portfolio: MHIPortfolio, order_gate: OrderGate) -> str:
     return tags
 
 
+def _contract_live_price(prices: dict[str, float], code: str, main_px: float) -> float | None:
+    """Last price for a named month; do not substitute MHImain for month contracts."""
+    if code in prices:
+        return float(prices[code])
+    if is_named_mhi_contract(code):
+        return None
+    return main_px
+
+
+def _refresh_broker_positions_if_due(
+    trade: TradeClient,
+    symbol: str,
+    cfg: dict,
+    portfolio: MHIPortfolio,
+    risk: RiskManager,
+    prices: dict[str, float],
+    fallback_price: float | None,
+    *,
+    last_refresh_mono: float,
+    refresh_sec: float,
+    now_mono: float,
+    order_gate: OrderGate | None = None,
+) -> float:
+    """Sync entry + legs from broker every refresh_sec (flat or holding)."""
+    if now_mono - last_refresh_mono < refresh_sec:
+        return last_refresh_mono
+    broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
+    changed_codes = portfolio.refresh_from_broker(broker_legs, risk)
+    if changed_codes:
+        if order_gate is not None and order_gate.pending and order_gate.order_code:
+            pending_code = order_gate.order_code.upper()
+            changed_codes = [
+                c
+                for c in changed_codes
+                if c.code.upper() != pending_code or c.contracts == 0
+            ]
+        if changed_codes:
+            _report_broker_position_changes(
+                symbol, portfolio, changed_codes, prices, fallback_price,
+            )
+    return now_mono
+
+
+def _report_broker_position_changes(
+    quote_symbol: str,
+    portfolio: MHIPortfolio,
+    changes: list[BrokerPositionChange],
+    prices: dict[str, float],
+    fallback_price: float | None,
+    *,
+    title_prefix: str = "Refresh",
+) -> None:
+    for change in changes:
+        code = change.code
+        px = prices.get(code)
+        if px is None and portfolio.front_contract and code.upper() == portfolio.front_contract.upper():
+            px = prices.get(quote_symbol)
+        if px is None:
+            px = fallback_price
+        if change.book == "entry":
+            strategy = portfolio.entry_strategy
+            position = portfolio.entry_position
+        else:
+            leg = portfolio.leg_for_code(code)
+            if leg is None:
+                if change.contracts != 0:
+                    continue
+                title = f"{title_prefix} {contract_log_label(code)}"
+                msg = f"{title} flat (0)"
+                LOG.info(
+                    msg,
+                    extra={
+                        "event": "position_refresh",
+                        "contract": code,
+                        "contracts": 0,
+                        "book": change.book,
+                    },
+                )
+                continue
+            strategy = leg.strategy
+            position = leg.position
+        title = f"{title_prefix} {contract_log_label(code)}"
+        msg = _position_snapshot_message(strategy, position, px, title=title)
+        LOG.info(
+            msg,
+            extra={
+                "event": "position_refresh",
+                "contract": code,
+                "contracts": change.contracts,
+                "book": change.book,
+            },
+        )
+        if change.book == "leg" and change.contracts == 0:
+            portfolio.remove_if_flat(code)
+
+
 def _print_portfolio_status(
     quote_symbol: str,
     prices: dict[str, float],
@@ -1196,46 +1731,19 @@ def _print_portfolio_status(
     status: str,
     update_time: str | None,
     *,
-    diff: float | None = None,
-    total_change: float | None = None,
+    move_diffs: dict[str, float] | None = None,
+    move_totals: dict[str, float] | None = None,
 ) -> None:
-    main_px = prices.get(quote_symbol, 0.0)
-    leg_bits = []
-    if portfolio.entry_position.contracts != 0:
-        entry_code = portfolio.managed_entry_code()
-        entry_px = prices.get(entry_code, main_px)
-        pnl = live_pnl_points(portfolio.entry_strategy, portfolio.entry_position, entry_px)
-        pnl_s = f" P/L{pnl:+.0f}" if pnl is not None else ""
-        front_label = contract_log_label(entry_code)
-        leg_bits.append(f"{front_label} {portfolio.entry_position.contracts:+d}{pnl_s}")
-    for leg in portfolio.ahead_of_front_legs():
-        px = prices.get(leg.code, main_px)
-        pnl = live_pnl_points(leg.strategy, leg.position, px)
-        pnl_s = f" P/L{pnl:+.0f}" if pnl is not None else ""
-        leg_bits.append(f"{contract_log_label(leg.code)} {leg.position.contracts:+d}{pnl_s}")
-    legs_tag = (" | " + ", ".join(leg_bits)) if leg_bits else " flat"
-    ts = update_time or datetime.now().strftime("%H:%M:%S")
-    move_tag = ""
-    if diff is not None and total_change is not None:
-        move_tag = f" {diff:+.0f}|{total_change:+.0f}"
-    LOG.info(
-        f"[{ts}] {main_px:.0f}{legs_tag}{move_tag} — {_compact_signal(status)}",
-        extra={
-            "event": "poll",
-            "symbol": quote_symbol,
-            "price": main_px,
-            "legs": {
-                **(
-                    {portfolio.managed_entry_code(): portfolio.entry_position.contracts}
-                    if portfolio.entry_position.contracts != 0
-                    else {}
-                ),
-                **{leg.code: leg.position.contracts for leg in portfolio.ahead_of_front_legs()},
-            },
-            "data_time": update_time,
-            "signal": status,
-        },
+    del status, move_diffs, move_totals
+    lines = _build_poll_status_lines(
+        quote_symbol,
+        prices,
+        portfolio,
+        update_time,
     )
+    ts = _poll_log_ts(update_time)
+    for line in lines:
+        LOG.info(f"{ts} {line}", extra={"event": "poll"})
 
 
 def execute_unit_order(
@@ -1265,9 +1773,17 @@ def execute_unit_order(
     if risk is not None:
         if portfolio_total_signed is not None:
             risk.position_shares = portfolio_total_signed
-        ok, cap_reason = risk.approve_order(side, order_qty)
+        ok, cap_reason = risk.approve_order(
+            side, order_qty, unit_contracts=position.contracts,
+        )
         if not ok:
-            return {"status": "rejected", "reason": cap_reason}
+            return {
+                "status": "rejected",
+                "reason": (
+                    f"{cap_reason} (unit={position.contracts:+d}"
+                    f" net={risk.position_shares:+d})"
+                ),
+            }
 
     max_slip = float(cfg.get("mhimain", {}).get("max_market_slippage_pts", 3))
     if quote_row is not None:
@@ -1308,14 +1824,13 @@ def _position_label(contracts: int) -> str:
     return "flat (0)"
 
 
-def _print_position_snapshot(
-    symbol: str,
+def _position_snapshot_message(
     strategy: MHImainStrategy,
     position: UnitPositionBook,
     live_price: float | None,
     *,
-    title: str = "Position",
-) -> None:
+    title: str,
+) -> str:
     pnl = live_pnl_points(strategy, position, live_price) if live_price is not None else None
     parts = [title, _position_label(position.contracts)]
     if strategy.entry_price is not None:
@@ -1327,7 +1842,20 @@ def _print_position_snapshot(
     if position.contracts != 0:
         bl = strategy.pnl_baseline
         parts.append(f"cut {bl.cut_loss_trigger():+.0f} profit {bl.take_profit_trigger():+.0f}")
-    LOG.info(" ".join(parts), extra={"event": "position_snapshot", "title": title, "contracts": position.contracts})
+    return " ".join(parts)
+
+
+def _print_position_snapshot(
+    symbol: str,
+    strategy: MHImainStrategy,
+    position: UnitPositionBook,
+    live_price: float | None,
+    *,
+    title: str = "Position",
+) -> None:
+    del symbol
+    msg = _position_snapshot_message(strategy, position, live_price, title=title)
+    LOG.info(msg, extra={"event": "position_snapshot", "title": title, "contracts": position.contracts})
 
 
 def _print_bootstrap(
@@ -1459,7 +1987,7 @@ def main() -> None:
         trend = TrendMode(str(trend_name).lower())
 
     portfolio = MHIPortfolio.create(cfg, trend=trend, quote_symbol=symbol)
-    risk = RiskManager({**cfg, "risk": {**cfg.get("risk", {}), "max_position_shares": 8}})
+    risk = RiskManager(cfg)
 
     LOG.info(
         "mhimain trader starting",
@@ -1504,19 +2032,18 @@ def main() -> None:
 
         _bootstrap_account_equity(trade, cfg, risk)
 
+        hkex_calendar = HKEXFrontCalendar()
+        hkex_spot_key: tuple[str, str] | None = None
         front_contract: str | None = None
         if is_continuous_mhi(symbol):
-            ok_front, front_contract = quote.resolve_front_contract(symbol)
-            if ok_front and front_contract:
-                LOG.info(
-                    "front-month contract resolved",
-                    extra={
-                        "event": "contract_rollover",
-                        "quote_symbol": symbol,
-                        "front_contract": front_contract,
-                    },
-                )
-        _sync_front_context(portfolio, quote, symbol, front_contract)
+            spot, hkex_spot_key = _refresh_hkex_spot_if_changed(
+                quote, hkex_calendar, hkex_spot_key, seed_ltd=True,
+            )
+            if spot:
+                front_contract = spot.front
+        else:
+            spot = None
+        _sync_front_context(portfolio, symbol, spot)
 
         sub_symbols = portfolio.quote_symbols()
         sub_ok, sub_msg = quote.subscribe_quote(sub_symbols)
@@ -1556,16 +2083,20 @@ def main() -> None:
                 symbol,
                 leg.strategy,
                 leg.position,
-                prices.get(leg.code, quote_price),
+                prices.get(leg.code) if leg.code in prices else None,
                 title=f"Startup {contract_log_label(leg.code)} (next month)",
             )
         if portfolio.is_flat():
-            _print_bootstrap(symbol, portfolio.entry_strategy, portfolio.entry_position, quote_price)
+            _, _, bootstrap_order = portfolio.flat_entry_target(front_contract)
+            bootstrap_px = prices.get(bootstrap_order, quote_price)
+            _print_bootstrap(symbol, portfolio.entry_strategy, portfolio.entry_position, bootstrap_px)
 
         order_gate = OrderGate()
         poll_display = PollDisplayGate(threshold_pts=poll_display_threshold)
-        if quote_price is not None:
-            poll_display.ref_price = quote_price
+        for code in _poll_display_codes(portfolio, symbol):
+            seed_px = prices.get(code)
+            if seed_px is not None:
+                poll_display.seed(code, float(seed_px))
 
         if (
             portfolio.is_flat()
@@ -1622,6 +2153,26 @@ def main() -> None:
         last_position_refresh = time.monotonic()
         try:
             while args.iterations is None or count < args.iterations:
+                if is_continuous_mhi(symbol):
+                    spot, hkex_spot_key = _refresh_hkex_spot_if_changed(
+                        quote, hkex_calendar, hkex_spot_key,
+                    )
+                    if spot:
+                        front_contract = spot.front
+                else:
+                    spot = None
+                _sync_front_context(portfolio, symbol, spot)
+
+                now_mono = time.monotonic()
+                last_position_refresh = _refresh_broker_positions_if_due(
+                    trade, symbol, cfg, portfolio, risk, last_prices,
+                    last_live_price,
+                    last_refresh_mono=last_position_refresh,
+                    refresh_sec=position_refresh_sec,
+                    now_mono=now_mono,
+                    order_gate=order_gate,
+                )
+
                 poll_symbols = portfolio.quote_symbols()
                 new_syms = portfolio.detect_new_subscriptions(poll_symbols)
                 if new_syms:
@@ -1647,9 +2198,17 @@ def main() -> None:
                         extra={"event": "quote_poll_failed", "symbol": symbol},
                     )
                     now_mono = time.monotonic()
-                    if now_mono - last_position_refresh >= position_refresh_sec:
+                    refresh_before = last_position_refresh
+                    last_position_refresh = _refresh_broker_positions_if_due(
+                        trade, symbol, cfg, portfolio, risk, last_prices,
+                        last_live_price,
+                        last_refresh_mono=last_position_refresh,
+                        refresh_sec=position_refresh_sec,
+                        now_mono=now_mono,
+                        order_gate=order_gate,
+                    )
+                    if now_mono - refresh_before >= position_refresh_sec:
                         _refresh_account_equity(trade, cfg, risk)
-                        last_position_refresh = now_mono
                     if last_live_price is not None and (
                         risk.killed
                         or (trade_unlock is not None and trade_unlock.is_expired())
@@ -1705,24 +2264,11 @@ def main() -> None:
                 if quote_fresh.block_entries:
                     _log_quote_stale(quote_fresh, event="quote_stale")
 
-                if is_continuous_mhi(symbol):
-                    ok_front, resolved_front = quote.resolve_front_contract(symbol)
-                    if ok_front and resolved_front:
-                        front_contract = resolved_front
-                _sync_front_context(portfolio, quote, symbol, front_contract)
-
-                if (
-                    portfolio.entry_position.contracts == 0
-                    and not order_gate.pending
-                    and (trade_unlock is None or not trade_unlock.is_expired())
-                ):
-                    broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
-                    portfolio.refresh_from_broker(broker_legs, risk)
-
                 entry_roll_skip, leg_roll_skip = _handle_portfolio_rollovers(
                     cfg, trade, quote, portfolio, risk, symbol,
                     rows, prices, order_gate, trade_unlock,
                     front_contract=front_contract,
+                    ltd_overrides=hkex_calendar.ltd_overrides if is_continuous_mhi(symbol) else None,
                 )
                 if leg_roll_skip:
                     time.sleep(poll_interval)
@@ -1730,33 +2276,7 @@ def main() -> None:
                     continue
 
                 if now_mono - last_position_refresh >= position_refresh_sec:
-                    if (
-                        not order_gate.pending
-                        and (trade_unlock is None or not trade_unlock.is_expired())
-                    ):
-                        broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
-                        changed_codes = portfolio.refresh_from_broker(broker_legs, risk)
-                        for code in changed_codes:
-                            if code == portfolio.managed_entry_code():
-                                _print_position_snapshot(
-                                    symbol,
-                                    portfolio.entry_strategy,
-                                    portfolio.entry_position,
-                                    prices.get(code, prices.get(symbol, price)),
-                                    title=f"Refresh {contract_log_label(code)}",
-                                )
-                                continue
-                            leg = portfolio.leg_for_code(code)
-                            if leg is not None:
-                                _print_position_snapshot(
-                                    symbol,
-                                    leg.strategy,
-                                    leg.position,
-                                    prices.get(code, price),
-                                    title=f"Refresh {contract_log_label(code)}",
-                                )
                     _refresh_account_equity(trade, cfg, risk)
-                    last_position_refresh = now_mono
 
                 if _handle_kill_switch_portfolio(
                     cfg, trade, portfolio, risk, quote, symbol,
@@ -1775,6 +2295,8 @@ def main() -> None:
                     continue
 
                 status = "flat"
+                display_status = "flat"
+                display_tags = quote_fresh.status_tag
                 if portfolio.is_flat():
                     if entry_roll_skip:
                         time.sleep(poll_interval)
@@ -1797,12 +2319,8 @@ def main() -> None:
                     status = signal.reason
                     if signal.action != Action.HOLD:
                         status = f"{contract_log_label(entry_order)} {signal.action.value}: {signal.reason}"
-                    show_poll, diff = poll_display.note_price(price)
-                    if show_poll:
-                        _print_portfolio_status(
-                            symbol, prices, portfolio, status + cooldown_tag, update_time,
-                            diff=diff, total_change=poll_display.total_change,
-                        )
+                    display_status = status
+                    display_tags = cooldown_tag
                     if risk.killed and portfolio.is_flat() and not order_gate.pending:
                         LOG.error(
                             "kill switch halt",
@@ -1822,10 +2340,12 @@ def main() -> None:
                         entry_order if portfolio.entry_position.contracts != 0 else None
                     )
                 else:
+                    skip_ahead_legs = False
                     if portfolio.entry_position.contracts != 0 and not entry_roll_skip:
                         entry_order = portfolio.managed_entry_code()
                         entry_trade_row, entry_price = _leg_trade_context(
-                            quote, symbol, entry_order, rows, prices
+                            quote, symbol, entry_order, rows, prices,
+                            front_contract=portfolio.front_contract,
                         )
                         signal = portfolio.entry_strategy.update(entry_price, portfolio.entry_position)
                         if portfolio.entry_strategy.consume_panic_trigger():
@@ -1838,12 +2358,8 @@ def main() -> None:
                             )
                         status = leg_status
                         cooldown_tag = _portfolio_tags(portfolio, order_gate)
-                        show_poll, diff = poll_display.note_price(price)
-                        if show_poll:
-                            _print_portfolio_status(
-                                symbol, prices, portfolio, leg_status + cooldown_tag, update_time,
-                                diff=diff, total_change=poll_display.total_change,
-                            )
+                        display_status = leg_status
+                        display_tags = cooldown_tag + quote_fresh.status_tag
                         if risk.killed and portfolio.is_flat() and not order_gate.pending:
                             LOG.error(
                                 "kill switch halt",
@@ -1863,59 +2379,78 @@ def main() -> None:
                             entry_order if portfolio.entry_position.contracts != 0 else None
                         )
                         if order_gate.pending:
-                            time.sleep(poll_interval)
-                            count += 1
-                            continue
+                            skip_ahead_legs = True
 
-                    for leg in portfolio.ahead_of_front_legs():
-                        leg_trade_row, leg_price = _leg_trade_context(
-                            quote, symbol, leg.code, rows, prices
-                        )
-                        signal = leg.strategy.update(leg_price, leg.position)
-                        if leg.strategy.consume_panic_trigger():
-                            _alert_panic_pause(leg.strategy, leg_price)
-                        if signal.action != Action.HOLD and not _allows_next_month_close(
-                            leg.position, signal.action
-                        ):
-                            LOG.info(
-                                "next-month entry blocked — manual opens only",
-                                extra={
-                                    "event": "next_month_entry_blocked",
-                                    "contract": leg.code,
-                                    "action": signal.action.value,
-                                },
+                    if not skip_ahead_legs:
+                        for leg in portfolio.ahead_of_front_legs():
+                            leg_trade_row, leg_price = _leg_trade_context(
+                                quote, symbol, leg.code, rows, prices,
+                                front_contract=portfolio.front_contract,
                             )
-                            continue
-                        leg_status = signal.reason
-                        if signal.action != Action.HOLD:
-                            leg_status = (
-                                f"{contract_log_label(leg.code)} "
-                                f"{signal.action.value}: {signal.reason}"
+                            signal = leg.strategy.update(leg_price, leg.position)
+                            if leg.strategy.consume_panic_trigger():
+                                _alert_panic_pause(leg.strategy, leg_price)
+                            if signal.action != Action.HOLD and not _allows_next_month_close(
+                                leg.position, signal.action
+                            ):
+                                LOG.info(
+                                    "next-month entry blocked — manual opens only",
+                                    extra={
+                                        "event": "next_month_entry_blocked",
+                                        "contract": leg.code,
+                                        "action": signal.action.value,
+                                    },
+                                )
+                                continue
+                            leg_status = signal.reason
+                            if signal.action != Action.HOLD:
+                                leg_status = (
+                                    f"{contract_log_label(leg.code)} "
+                                    f"{signal.action.value}: {signal.reason}"
+                                )
+                            status = leg_status
+                            cooldown_tag = _portfolio_tags(portfolio, order_gate)
+                            display_status = leg_status
+                            display_tags = cooldown_tag + quote_fresh.status_tag
+                            if risk.killed and portfolio.is_flat() and not order_gate.pending:
+                                LOG.error(
+                                    "kill switch halt",
+                                    extra={"event": "kill_switch_halt", "reason": risk.kill_reason},
+                                )
+                                break
+                            if signal.action == Action.HOLD:
+                                continue
+                            _process_signal(
+                                cfg, trade, leg.position, leg.strategy, risk,
+                                signal, symbol, leg_trade_row, leg_price, order_gate, trade_unlock,
+                                order_code=leg.code,
+                                portfolio=portfolio,
                             )
-                        status = leg_status
-                        cooldown_tag = _portfolio_tags(portfolio, order_gate)
-                        show_poll, diff = poll_display.note_price(price)
-                        if show_poll:
-                            _print_portfolio_status(
-                                symbol, prices, portfolio, leg_status + cooldown_tag, update_time,
-                                diff=diff, total_change=poll_display.total_change,
-                            )
-                        if risk.killed and portfolio.is_flat() and not order_gate.pending:
-                            LOG.error(
-                                "kill switch halt",
-                                extra={"event": "kill_switch_halt", "reason": risk.kill_reason},
-                            )
-                            break
-                        if signal.action == Action.HOLD:
-                            continue
-                        _process_signal(
-                            cfg, trade, leg.position, leg.strategy, risk,
-                            signal, symbol, leg_trade_row, leg_price, order_gate, trade_unlock,
-                            order_code=leg.code,
-                            portfolio=portfolio,
-                        )
-                        if order_gate.pending:
-                            break
+                            if order_gate.pending:
+                                break
+
+                poll_codes = _poll_display_codes(portfolio, symbol)
+                display_prices = _poll_prices_for_display(
+                    prices, symbol, portfolio, poll_codes,
+                )
+                update_time = _poll_update_time(data_times, symbol, portfolio)
+                for code in poll_codes:
+                    seed_px = display_prices.get(code)
+                    if seed_px is not None:
+                        poll_display.seed(code, float(seed_px))
+                show_poll, move_diffs, move_totals = poll_display.note_prices(
+                    display_prices, poll_codes,
+                )
+                if show_poll:
+                    _print_portfolio_status(
+                        symbol,
+                        display_prices,
+                        portfolio,
+                        display_status + display_tags,
+                        update_time,
+                        move_diffs=move_diffs,
+                        move_totals=move_totals,
+                    )
 
                 time.sleep(poll_interval)
                 count += 1

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import calendar
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -113,6 +114,254 @@ def next_named_mhi_contract(code: str) -> str | None:
         month = 1
         year += 1
     return f"HK.MHI{year % 100:02d}{month:02d}"
+
+
+def named_mhi_contract(year: int, month: int) -> str:
+    return f"HK.MHI{year % 100:02d}{month:02d}"
+
+
+def month_offset(from_key: tuple[int, int], to_key: tuple[int, int]) -> int:
+    """Signed calendar-month distance (to - from)."""
+    return (to_key[0] - from_key[0]) * 12 + (to_key[1] - from_key[1])
+
+
+def estimate_mhi_last_trade_day(year: int, month: int) -> date:
+    """HKEX mini HSI/MHI: LTD is the second-last trading day of the contract month (Mon–Fri)."""
+    last_dom = calendar.monthrange(year, month)[1]
+    d = date(year, month, last_dom)
+    business: list[date] = []
+    while d.month == month:
+        if d.weekday() < 5:
+            business.append(d)
+        d -= timedelta(days=1)
+    business.reverse()
+    if len(business) >= 2:
+        return business[-2]
+    if business:
+        return business[-1]
+    raise ValueError(f"no business days in {year}-{month:02d}")
+
+
+def build_hkex_mhi_contract_list(
+    *,
+    now: datetime | None = None,
+    months_back: int = 1,
+    months_ahead: int = 6,
+    ltd_overrides: dict[str, date] | None = None,
+) -> list[tuple[str, str]]:
+    """(code, last_trade_time) rows for pick_hkex_front_month — no broker call."""
+    ref = (now or datetime.now(HK)).astimezone(HK)
+    year, month = ref.year, ref.month
+    out: list[tuple[str, str]] = []
+    start_offset = -months_back
+    for i in range(start_offset, months_ahead + 1):
+        m = month + i
+        y = year
+        while m < 1:
+            m += 12
+            y -= 1
+        while m > 12:
+            m -= 12
+            y += 1
+        code = named_mhi_contract(y, m)
+        if ltd_overrides and code in ltd_overrides:
+            ltd_day = ltd_overrides[code]
+        else:
+            ltd_day = estimate_mhi_last_trade_day(y, m)
+        out.append((code, f"{ltd_day.isoformat()} 16:00:00"))
+    return out
+
+
+def local_contract_last_trade_time(
+    code: str,
+    *,
+    ltd_overrides: dict[str, date] | None = None,
+) -> str | None:
+    """HKEX LTD for a named month without OpenD (overrides from one-shot startup fetch)."""
+    if not is_named_mhi_contract(code):
+        return None
+    key = contract_month_key(code)
+    if key is None:
+        return None
+    year, month = key
+    if ltd_overrides and code in ltd_overrides:
+        ltd_day = ltd_overrides[code]
+    else:
+        ltd_day = estimate_mhi_last_trade_day(year, month)
+    return normalize_last_trade_time(f"{ltd_day.isoformat()} 16:00:00")
+
+
+def ltd_date_label(ltd: str | None) -> str:
+    """YYYY-MM-DD for logs; accepts normalized or raw LTD strings."""
+    if not ltd:
+        return "?"
+    day = parse_last_trade_date(ltd)
+    if day is not None:
+        return day.isoformat()
+    return str(ltd).split()[0]
+
+
+def hkex_spot_startup_message(spot: HKEXMHISpot) -> str:
+    """One-line startup banner: MHImain front month + next month with LTD dates."""
+    front = contract_log_label(spot.front)
+    nxt = contract_log_label(spot.next)
+    return (
+        f"HKEX calendar: MHImain {front} LTD {ltd_date_label(spot.front_ltd)}"
+        f" | next {nxt} LTD {ltd_date_label(spot.next_ltd)}"
+    )
+
+
+@dataclass(frozen=True)
+class HKEXMHISpot:
+    """HKEX spot month (MHImain front) and next month from calendar rules."""
+
+    front: str
+    next: str
+    front_ltd: str | None
+    next_ltd: str | None = None
+
+    @classmethod
+    def resolve(
+        cls,
+        *,
+        now: datetime | None = None,
+        ltd_overrides: dict[str, date] | None = None,
+    ) -> HKEXMHISpot | None:
+        ref = (now or datetime.now(HK)).astimezone(HK)
+        contracts = build_hkex_mhi_contract_list(now=ref, ltd_overrides=ltd_overrides)
+        front = pick_hkex_front_month(contracts, now=ref)
+        if not front:
+            return None
+        nxt = next_named_mhi_contract(front)
+        if not nxt:
+            return None
+        ltd_map = {
+            code: parse_last_trade_date(ltd)
+            for code, ltd in contracts
+        }
+
+        def _ltd_for(code: str) -> str | None:
+            if ltd_overrides and code in ltd_overrides:
+                ltd_day = ltd_overrides[code]
+            else:
+                ltd_day = ltd_map.get(code)
+            if ltd_day is None:
+                return None
+            return normalize_last_trade_time(f"{ltd_day.isoformat()} 16:00:00")
+
+        return cls(
+            front=front,
+            next=nxt,
+            front_ltd=_ltd_for(front),
+            next_ltd=_ltd_for(nxt),
+        )
+
+
+@dataclass
+class HKEXFrontCalendar:
+    """Cached HKEX front/next; recomputes on date or post-AHT LTD flip only."""
+
+    _spot: HKEXMHISpot | None = field(default=None, repr=False)
+    _cache_day: date | None = field(default=None, repr=False)
+    _cache_after_aht: bool = field(default=False, repr=False)
+    ltd_overrides: dict[str, date] = field(default_factory=dict)
+
+    def _needs_refresh(self, ref: datetime) -> bool:
+        day = ref.date()
+        after_aht = ref.timetz() >= datetime.combine(day, AHT_SESSION_START, tzinfo=HK).timetz()
+        if self._spot is None or self._cache_day != day:
+            return True
+        if self._spot.front_ltd:
+            ltd_day = parse_last_trade_date(self._spot.front_ltd)
+            if ltd_day is not None and day > ltd_day:
+                return True
+        if self._cache_after_aht != after_aht and self._spot.front_ltd:
+            if is_last_trading_day(self._spot.front_ltd, now=ref):
+                return True
+        return False
+
+    def spot_key(self) -> tuple[str, str] | None:
+        if self._spot is None:
+            return None
+        return (self._spot.front, self._spot.next)
+
+    def spot(self, *, now: datetime | None = None) -> HKEXMHISpot | None:
+        ref = (now or datetime.now(HK)).astimezone(HK)
+        if self._needs_refresh(ref):
+            self._spot = HKEXMHISpot.resolve(now=ref, ltd_overrides=self.ltd_overrides or None)
+            self._cache_day = ref.date()
+            self._cache_after_aht = (
+                ref.timetz() >= datetime.combine(ref.date(), AHT_SESSION_START, tzinfo=HK).timetz()
+            )
+        return self._spot
+
+    def merge_ltd_overrides(self, overrides: dict[str, date]) -> None:
+        if not overrides:
+            return
+        self.ltd_overrides.update(overrides)
+        self._spot = None
+        self._cache_day = None
+        self._cache_after_aht = False
+
+
+def is_plausible_rollover_front(held_contract: str, front_contract: str) -> bool:
+    """Front must be at most one month ahead of held (never 2606 → 2612)."""
+    held_key = contract_month_key(held_contract)
+    front_key = contract_month_key(front_contract)
+    if held_key is None or front_key is None:
+        return False
+    diff = month_offset(held_key, front_key)
+    return 0 < diff <= 1
+
+
+def clamp_rollover_target(held_contract: str, target: str | None) -> str | None:
+    """Roll one calendar month at a time; reject multi-month broker jumps."""
+    if not target or not is_named_mhi_contract(held_contract):
+        return target
+    held_key = contract_month_key(held_contract)
+    target_key = contract_month_key(target)
+    if held_key is None or target_key is None:
+        return target
+    step = next_named_mhi_contract(held_contract)
+    if step is None:
+        return target
+    diff = month_offset(held_key, target_key)
+    if diff <= 0:
+        return target
+    if diff == 1:
+        return target
+    return step
+
+
+def resolve_rollover_target(
+    held_contract: str,
+    front_contract: str | None,
+    *,
+    last_trade_time: str | None = None,
+    now: datetime | None = None,
+    ltd_overrides: dict[str, date] | None = None,
+) -> str | None:
+    """Roll target: HKEX front when held is one month behind; else next month from 11:58 on LTD."""
+    if not is_named_mhi_contract(held_contract):
+        return None
+
+    ref = (now or datetime.now(HK)).astimezone(HK)
+    if front_contract and is_held_behind_front(held_contract, front_contract):
+        if not is_plausible_rollover_front(held_contract, front_contract):
+            spot = HKEXMHISpot.resolve(now=ref, ltd_overrides=ltd_overrides)
+            front_contract = spot.front if spot else front_contract
+        if is_plausible_rollover_front(held_contract, front_contract):
+            return clamp_rollover_target(held_contract, front_contract)
+        if is_held_behind_front(held_contract, front_contract):
+            return next_named_mhi_contract(held_contract)
+
+    norm = normalize_last_trade_time(last_trade_time)
+    if not is_ltd_rollover_active(norm, now=ref, normalized=True):
+        return None
+    if front_contract and is_held_ahead_of_front(held_contract, front_contract):
+        return None
+    target = next_named_mhi_contract(held_contract)
+    return clamp_rollover_target(held_contract, target)
 
 
 def is_ltd_expiring_open_window(
@@ -332,29 +581,6 @@ def pick_hkex_front_month(
     return best_code
 
 
-def resolve_rollover_target(
-    held_contract: str,
-    front_contract: str | None,
-    *,
-    last_trade_time: str | None = None,
-    now: datetime | None = None,
-) -> str | None:
-    """Roll target: broker front when held is behind front; else next month from 11:58 on LTD."""
-    if not is_named_mhi_contract(held_contract):
-        return None
-
-    ref = (now or datetime.now(HK)).astimezone(HK)
-    if front_contract and is_held_behind_front(held_contract, front_contract):
-        return front_contract
-
-    norm = normalize_last_trade_time(last_trade_time)
-    if not is_ltd_rollover_active(norm, now=ref, normalized=True):
-        return None
-    if front_contract and is_held_ahead_of_front(held_contract, front_contract):
-        return None
-    return next_named_mhi_contract(held_contract)
-
-
 def should_rollover(
     held_contract: str,
     front_contract: str | None,
@@ -362,6 +588,7 @@ def should_rollover(
     *,
     now: datetime | None = None,
     on_last_trade_day: bool = True,
+    ltd_overrides: dict[str, date] | None = None,
 ) -> tuple[bool, str]:
     """True when held is behind broker front, or from 11:58 HKT on held's LTD."""
     if not held_contract or not is_named_mhi_contract(held_contract):
@@ -371,11 +598,16 @@ def should_rollover(
         if is_held_ahead_of_front(held_contract, front_contract):
             return False, ""
         if is_held_behind_front(held_contract, front_contract):
+            if not is_plausible_rollover_front(held_contract, front_contract):
+                spot = HKEXMHISpot.resolve(now=ref, ltd_overrides=ltd_overrides)
+                if spot:
+                    front_contract = spot.front
             target = resolve_rollover_target(
                 held_contract,
                 front_contract,
                 last_trade_time=last_trade_time,
                 now=ref,
+                ltd_overrides=ltd_overrides,
             )
             if target:
                 return True, "held_behind_front"
@@ -390,6 +622,7 @@ def should_rollover(
         front_contract,
         last_trade_time=norm,
         now=ref,
+        ltd_overrides=ltd_overrides,
     ) is None:
         return False, ""
     return True, "last_trading_day"

@@ -17,6 +17,7 @@ from robs.execution.position_sync import (
     fetch_broker_position,
     fetch_broker_position_for_code,
     refresh_broker_position,
+    _signed_contracts_from_row,
 )
 from robs.strategy.mhimain import MHImainStrategy
 
@@ -210,6 +211,71 @@ class MultiContractPositionFetchTests(unittest.TestCase):
         self.assertEqual(by_code["HK.MHI2607"].contracts, -1)
         self.assertEqual(by_code["HK.MHI2606"].current_price, 19950.0)
         self.assertEqual(by_code["HK.MHI2607"].current_price, 20010.0)
+
+    def test_fetch_mhi_legs_does_not_substitute_mhimain_for_missing_month(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.side_effect = [
+            (0, pd.DataFrame()),
+            (0, self._multi_leg_df()),
+        ]
+        legs = fetch_broker_mhi_legs(
+            trade,
+            "HK.MHImain",
+            {"trd_env": "SIMULATE"},
+            quote_prices={"HK.MHImain": 19990.0, "HK.MHI2606": 19950.0},
+        )
+        by_code = {leg.code: leg for leg in legs}
+        self.assertIsNone(by_code["HK.MHI2607"].current_price)
+
+
+class SignedContractsFromRowTests(unittest.TestCase):
+    def test_na_position_side_infers_short_from_pnl(self) -> None:
+        row = pd.Series(
+            {
+                "qty": 6.0,
+                "position_side": "N/A",
+                "cost_price": 23000.0,
+                "nominal_price": 23050.0,
+                "pl_val": -300.0,
+            }
+        )
+        self.assertEqual(_signed_contracts_from_row(row), -6)
+
+    def test_na_position_side_infers_long_from_pnl(self) -> None:
+        row = pd.Series(
+            {
+                "qty": 6.0,
+                "position_side": "N/A",
+                "cost_price": 23000.0,
+                "nominal_price": 23050.0,
+                "pl_val": 300.0,
+            }
+        )
+        self.assertEqual(_signed_contracts_from_row(row), 6)
+
+    def test_na_position_side_infers_short_from_can_sell_qty(self) -> None:
+        row = pd.Series(
+            {
+                "qty": 6.0,
+                "can_sell_qty": 0.0,
+                "position_side": "N/A",
+                "cost_price": 23000.0,
+                "nominal_price": 23050.0,
+            }
+        )
+        self.assertEqual(_signed_contracts_from_row(row), -6)
+
+    def test_na_position_side_infers_short_from_loss_price_up(self) -> None:
+        row = pd.Series(
+            {
+                "qty": 6.0,
+                "position_side": "N/A",
+                "cost_price": 23000.0,
+                "nominal_price": 23050.0,
+                "pl_val": -300.0,
+            }
+        )
+        self.assertEqual(_signed_contracts_from_row(row), -6)
 
 
 if __name__ == "__main__":

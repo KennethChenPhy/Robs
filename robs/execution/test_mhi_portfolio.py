@@ -9,7 +9,20 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from robs.cli.mhimain import PollDisplayGate, _allows_next_month_close
+from robs.cli.mhimain import (
+    PollDisplayGate,
+    _allows_next_month_close,
+    _build_poll_status_lines,
+    _compact_poll_signal,
+    _format_poll_move,
+    _leg_trade_context,
+    _lookup_quote_price,
+    _lookup_quote_row,
+    _poll_display_codes,
+    _poll_prices_for_display,
+    _poll_update_time,
+    _resolve_contract_poll_price,
+)
 from robs.execution.contract_rollover import (
     contract_month_key,
     is_held_ahead_of_front,
@@ -148,7 +161,10 @@ class PortfolioRefreshMultiLegTests(unittest.TestCase):
             ),
         ]
         portfolio.refresh_from_broker(updated, risk)
-        self.assertNotIn("HK.MHI2607", portfolio.legs)
+        leg = portfolio.leg_for_code("HK.MHI2607")
+        self.assertIsNotNone(leg)
+        assert leg is not None
+        self.assertEqual(leg.position.contracts, 0)
         self.assertEqual(portfolio.entry_position.contracts, 2)
 
 
@@ -268,6 +284,39 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
             self.assertEqual(order_code, "HK.MHI2607")
             self.assertEqual(portfolio.entry_watch_code(), "HK.MHI2607")
 
+    def test_portfolio_roll_day_quotes_watch_month(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"rollover_on_last_trade_day": True}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 29, 12, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            syms = portfolio.quote_symbols()
+        self.assertEqual(syms, ["HK.MHImain", "HK.MHI2606", "HK.MHI2607"])
+
+    def test_quote_symbols_include_rollover_target(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"contract_rollover": True}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        portfolio.entry_position.contracts = 1
+        portfolio.entry_book_code = "HK.MHI2606"
+        portfolio.entry_rollover.begin(
+            held="HK.MHI2606",
+            front="HK.MHI2607",
+            direction=1,
+            reason="test",
+        )
+        syms = portfolio.quote_symbols()
+        self.assertIn("HK.MHI2606", syms)
+        self.assertIn("HK.MHI2607", syms)
+
     def test_roll_day_broker_row_on_entry_not_leg(self) -> None:
         from robs.execution.risk import RiskManager
 
@@ -297,6 +346,42 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
             portfolio.refresh_from_broker([broker], risk)
             self.assertIsNone(portfolio.leg_for_code("HK.MHI2607"))
 
+    def test_refresh_only_reports_when_broker_contracts_change(self) -> None:
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2607", "2026-07-30 11:58:00")
+        risk = RiskManager({"risk": {"max_position_shares": 8}})
+        broker = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=-6,
+            qty=6,
+            entry_price=23000.0,
+            current_price=23026.0,
+            pnl_points=-26.0,
+            pnl_val=None,
+        )
+        portfolio.bootstrap_from_broker([broker], risk, ma5=None, front_contract="HK.MHI2607")
+        self.assertEqual(portfolio.refresh_from_broker([broker], risk), [])
+        portfolio.entry_position.contracts = 0
+        self.assertEqual(portfolio.refresh_from_broker([broker], risk), [])
+        updated = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=-4,
+            qty=4,
+            entry_price=23000.0,
+            current_price=23020.0,
+            pnl_points=-20.0,
+            pnl_val=None,
+        )
+        changed = portfolio.refresh_from_broker([updated], risk)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].contracts, -4)
+
     def test_manual_next_month_tracks_as_leg(self) -> None:
         portfolio = MHIPortfolio.create(
             {"mhimain": {}},
@@ -306,6 +391,109 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
         portfolio.update_front_context("HK.MHI2606", "2026-07-30 11:58:00")
         self.assertTrue(portfolio.tracks_as_next_month_leg("HK.MHI2607"))
         self.assertFalse(portfolio.tracks_on_entry_book("HK.MHI2607"))
+
+    def test_bootstrap_next_month_only_goes_to_leg(self) -> None:
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        risk = RiskManager({"risk": {"max_position_shares": 8}})
+        broker = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=-2,
+            qty=2,
+            entry_price=23043.0,
+            current_price=23058.0,
+            pnl_points=-15.0,
+            pnl_val=None,
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 25, 10, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            portfolio.bootstrap_from_broker([broker], risk, ma5=None, front_contract="HK.MHI2606")
+        self.assertEqual(portfolio.entry_position.contracts, 0)
+        leg = portfolio.leg_for_code("HK.MHI2607")
+        self.assertIsNotNone(leg)
+        assert leg is not None
+        self.assertEqual(leg.position.contracts, -2)
+
+    def test_manual_next_month_leg_close_synced(self) -> None:
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        risk = RiskManager({"risk": {"max_position_shares": 8}})
+        broker = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=-2,
+            qty=2,
+            entry_price=23043.0,
+            current_price=23058.0,
+            pnl_points=-15.0,
+            pnl_val=None,
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 25, 10, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            portfolio.bootstrap_from_broker([broker], risk, ma5=None, front_contract="HK.MHI2606")
+        changed = portfolio.refresh_from_broker([], risk)
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(changed[0].code, "HK.MHI2607")
+        self.assertEqual(changed[0].contracts, 0)
+        leg = portfolio.leg_for_code("HK.MHI2607")
+        self.assertIsNotNone(leg)
+        assert leg is not None
+        self.assertEqual(leg.position.contracts, 0)
+
+    def test_report_manual_leg_flat_after_refresh(self) -> None:
+        from robs.cli.mhimain import _report_broker_position_changes
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        risk = RiskManager({"risk": {"max_position_shares": 8}})
+        broker = BrokerPosition(
+            code="HK.MHI2607",
+            contracts=-2,
+            qty=2,
+            entry_price=23043.0,
+            current_price=23058.0,
+            pnl_points=-15.0,
+            pnl_val=None,
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 25, 10, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            portfolio.bootstrap_from_broker([broker], risk, ma5=None, front_contract="HK.MHI2606")
+        changed = portfolio.refresh_from_broker([], risk)
+        with patch("robs.cli.mhimain.LOG") as mock_log:
+            _report_broker_position_changes(
+                "HK.MHImain",
+                portfolio,
+                changed,
+                {"HK.MHI2607": 23058.0},
+                23058.0,
+            )
+        self.assertTrue(mock_log.info.called)
+        msg = str(mock_log.info.call_args[0][0])
+        self.assertIn("MHI2607", msg)
+        self.assertIn("flat (0)", msg)
+        self.assertIsNone(portfolio.leg_for_code("HK.MHI2607"))
 
     def test_roll_day_entry_persists_after_roll_day(self) -> None:
         from robs.execution.risk import RiskManager
@@ -345,13 +533,165 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
 
 
 class PollDisplayGateTests(unittest.TestCase):
-    def test_note_price_tolerates_none(self) -> None:
+    def test_note_prices_skips_missing_codes(self) -> None:
         gate = PollDisplayGate(threshold_pts=10.0)
-        gate.ref_price = 20000.0
-        show, diff = gate.note_price(None)
+        gate.seed("HK.MHImain", 20000.0)
+        show, diffs, totals = gate.note_prices({}, ["HK.MHImain"])
         self.assertFalse(show)
-        self.assertEqual(diff, 0.0)
-        self.assertEqual(gate.ref_price, 20000.0)
+        self.assertEqual(diffs, {})
+        self.assertEqual(gate._legs["HK.MHImain"].ref_price, 20000.0)
+
+    def test_parallel_gates_independent(self) -> None:
+        gate = PollDisplayGate(threshold_pts=10.0)
+        gate.seed("HK.MHImain", 20000.0)
+        gate.seed("HK.MHI2607", 20100.0)
+        show, diffs, totals = gate.note_prices(
+            {"HK.MHImain": 20005.0, "HK.MHI2607": 20100.0},
+            ["HK.MHImain", "HK.MHI2607"],
+        )
+        self.assertFalse(show)
+        show, diffs, totals = gate.note_prices(
+            {"HK.MHImain": 20000.0, "HK.MHI2607": 20115.0},
+            ["HK.MHImain", "HK.MHI2607"],
+        )
+        self.assertTrue(show)
+        self.assertNotIn("HK.MHImain", diffs)
+        self.assertEqual(diffs["HK.MHI2607"], 15.0)
+        self.assertEqual(totals["HK.MHI2607"], 15.0)
+
+    def test_format_poll_move_single(self) -> None:
+        self.assertEqual(_format_poll_move({"HK.MHImain": 4.0}, "HK.MHImain"), "Δ+4")
+        self.assertEqual(_format_poll_move({"HK.MHImain": 4.0}, "HK.MHI2607"), "")
+
+    def test_compact_poll_signal_take_profit(self) -> None:
+        text = _compact_poll_signal(
+            "MHI2607 FLAT: take profit at +28pts (now +35) [ORDER_PENDING]"
+        )
+        self.assertEqual(text, "2607 TP +35 [ORDER_PENDING]")
+
+    def test_build_poll_status_lines_two_row(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"cut_loss_pts": 20, "take_profit_pts": 40}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", None)
+        portfolio.entry_position.contracts = 7
+        portfolio.entry_book_code = "HK.MHI2606"
+        portfolio.entry_strategy.entry_price = 23074.0
+        leg = portfolio.ensure_leg("HK.MHI2607")
+        leg.position.contracts = 9
+        leg.strategy.entry_price = 23017.0
+        lines = _build_poll_status_lines(
+            "HK.MHImain",
+            {"HK.MHImain": 23099.0, "HK.MHI2606": 23099.0, "HK.MHI2607": 23052.0},
+            portfolio,
+            "22:31:20.820",
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(
+            lines[0],
+            "MHI2606 ent 23074 long (+7), last 23099, pnl +25, cut 23054, tp 23114",
+        )
+        self.assertEqual(
+            lines[1],
+            "MHI2607 ent 23017 long (+9), last 23052, pnl +35, cut 22997, tp 23057",
+        )
+
+    def test_build_poll_status_lines_front_only(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"cut_loss_pts": 20, "take_profit_pts": 40}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", None)
+        portfolio.entry_position.contracts = 7
+        portfolio.entry_book_code = "HK.MHI2606"
+        portfolio.entry_strategy.entry_price = 23074.0
+        lines = _build_poll_status_lines(
+            "HK.MHImain",
+            {"HK.MHImain": 23099.0, "HK.MHI2606": 23099.0},
+            portfolio,
+            "22:31:20.820",
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertIn("MHI2606 ent 23074 long (+7)", lines[0])
+
+    def test_build_poll_status_lines_roll_day_entry(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"cut_loss_pts": 20, "take_profit_pts": 40}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", None)
+        portfolio.entry_position.contracts = 9
+        portfolio.entry_book_code = "HK.MHI2607"
+        portfolio.entry_strategy.entry_price = 23017.0
+        lines = _build_poll_status_lines(
+            "HK.MHImain",
+            {"HK.MHImain": 23093.0, "HK.MHI2606": 23093.0, "HK.MHI2607": 23040.0},
+            portfolio,
+            "22:52:41.400",
+        )
+        self.assertEqual(len(lines), 2)
+        self.assertIn("MHI2606 ent - flat (0)", lines[0])
+        self.assertIn("MHI2607 ent 23017 long (+9)", lines[1])
+
+    def test_build_poll_status_lines_flat_uses_mhimain_for_front(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", None)
+        lines = _build_poll_status_lines(
+            "HK.MHImain",
+            {"HK.MHImain": 23099.0},
+            portfolio,
+            "22:52:41.400",
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertIn("MHI2606 ent - flat (0), last 23099, pnl 0", lines[0])
+
+    def test_resolve_contract_poll_price_front_fallback(self) -> None:
+        px = _resolve_contract_poll_price(
+            {"HK.MHImain": 23099.0},
+            "HK.MHI2606",
+            "HK.MHImain",
+            "HK.MHI2606",
+        )
+        self.assertEqual(px, 23099.0)
+        self.assertIsNone(
+            _resolve_contract_poll_price(
+                {"HK.MHImain": 23099.0},
+                "HK.MHI2607",
+                "HK.MHImain",
+                "HK.MHI2606",
+            )
+        )
+
+    def test_quote_symbols_include_front_when_flat(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        portfolio.update_front_context("HK.MHI2606", None)
+        self.assertEqual(portfolio.quote_symbols(), ["HK.MHImain", "HK.MHI2606"])
+
+    def test_poll_display_codes_flat_roll_day(self) -> None:
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"rollover_on_last_trade_day": True}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 29, 12, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            codes = _poll_display_codes(portfolio, "HK.MHImain")
+        self.assertEqual(codes, ["HK.MHImain", "HK.MHI2606", "HK.MHI2607"])
 
 
 class RollDayFrontMonthSyncTests(unittest.TestCase):
@@ -865,6 +1205,52 @@ class EntryBookRolloverTests(unittest.TestCase):
         self.assertNotIn("HK.MHI2607", portfolio.legs)
         self.assertEqual(changed, [])
 
+    def test_refresh_manual_front_month_while_entry_on_next(self) -> None:
+        from robs.execution.risk import RiskManager
+
+        portfolio = MHIPortfolio.create(
+            {"mhimain": {"rollover_on_last_trade_day": True}},
+            trend=TrendMode.BULL,
+            quote_symbol="HK.MHImain",
+        )
+        hk = ZoneInfo("Asia/Hong_Kong")
+        portfolio.update_front_context("HK.MHI2606", "2026-06-29 11:58:00")
+        portfolio.entry_book_code = "HK.MHI2607"
+        portfolio.entry_position.contracts = 9
+        portfolio.entry_strategy.entry_price = 23017.0
+        risk = RiskManager({"risk": {"max_position_shares": 16}})
+        broker_legs = [
+            BrokerPosition(
+                code="HK.MHI2606",
+                contracts=7,
+                qty=7,
+                entry_price=23074.0,
+                current_price=23099.0,
+                pnl_points=25.0,
+                pnl_val=None,
+            ),
+            BrokerPosition(
+                code="HK.MHI2607",
+                contracts=9,
+                qty=9,
+                entry_price=23017.0,
+                current_price=23040.0,
+                pnl_points=23.0,
+                pnl_val=None,
+            ),
+        ]
+        with patch("robs.execution.contract_rollover.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2026, 6, 29, 12, 0, tzinfo=hk)
+            mock_dt.strptime = datetime.strptime
+            changed = portfolio.refresh_from_broker(broker_legs, risk)
+        self.assertEqual(portfolio.entry_position.contracts, 9)
+        self.assertEqual(portfolio.entry_book_code, "HK.MHI2607")
+        leg = portfolio.leg_for_code("HK.MHI2606")
+        self.assertIsNotNone(leg)
+        assert leg is not None
+        self.assertEqual(leg.position.contracts, 7)
+        self.assertIn("HK.MHI2606", [c.code for c in changed])
+
 
 class NextMonthCloseOnlyTests(unittest.TestCase):
     def test_allows_close_not_open(self) -> None:
@@ -979,6 +1365,69 @@ class NonMhiProductCodeTests(unittest.TestCase):
         self.assertFalse(is_hk_mhi_product_code("HK.HTImain"))
         self.assertFalse(is_hk_mhi_product_code("HK.HTI2606"))
         self.assertFalse(is_hk_mhi_product_code("HK.HSI2606"))
+
+
+class QuoteRowLookupTests(unittest.TestCase):
+    def test_lookup_quote_row_with_pandas_series(self) -> None:
+        row = pd.Series({"code": "HK.MHI2607", "last_price": 21000.0})
+        rows = {"HK.MHI2607": row}
+        self.assertIs(_lookup_quote_row(rows, "HK.MHI2607", "HK.MHImain"), row)
+        self.assertIsNone(_lookup_quote_row(rows, "HK.MHImain"))
+
+    def test_lookup_quote_price_prefers_first_key(self) -> None:
+        prices = {"HK.MHI2607": 21000.0, "HK.MHImain": 20950.0}
+        self.assertEqual(_lookup_quote_price(prices, "HK.MHI2607", "HK.MHImain"), 21000.0)
+        self.assertEqual(_lookup_quote_price(prices, "HK.MHImain"), 20950.0)
+        self.assertEqual(_lookup_quote_price(prices, "HK.MHI2608"), 0.0)
+
+    def test_leg_trade_context_does_not_use_series_truthiness(self) -> None:
+        row = pd.Series({"code": "HK.MHI2607", "last_price": 21000.0, "bid_price": 20999.0, "ask_price": 21001.0})
+        rows = {"HK.MHI2607": row}
+        prices = {"HK.MHI2607": 21000.0}
+
+        class _Quote:
+            def quote_for_trade(self, symbol: str, row=None):
+                return symbol, row
+
+        trade_row, price = _leg_trade_context(_Quote(), "HK.MHImain", "HK.MHI2607", rows, prices)
+        self.assertIs(trade_row, row)
+        self.assertEqual(price, 21000.0)
+
+    def test_leg_trade_context_named_month_skips_mhimain_fallback(self) -> None:
+        rows = {
+            "HK.MHImain": pd.Series({"code": "HK.MHImain", "last_price": 19990.0}),
+        }
+        prices = {"HK.MHImain": 19990.0}
+
+        class _Quote:
+            def quote_for_trade(self, symbol: str, row=None):
+                return symbol, row
+
+        trade_row, price = _leg_trade_context(
+            _Quote(), "HK.MHImain", "HK.MHI2607", rows, prices,
+            front_contract="HK.MHI2606",
+        )
+        self.assertIsNone(trade_row)
+        self.assertIsNone(price)
+
+    def test_leg_trade_context_front_month_uses_mhimain_fallback(self) -> None:
+        rows = {
+            "HK.MHImain": pd.Series(
+                {"code": "HK.MHImain", "last_price": 23024.0, "bid_price": 23023.0, "ask_price": 23025.0},
+            ),
+        }
+        prices = {"HK.MHImain": 23024.0}
+
+        class _Quote:
+            def quote_for_trade(self, symbol: str, row=None):
+                return symbol, row
+
+        trade_row, price = _leg_trade_context(
+            _Quote(), "HK.MHImain", "HK.MHI2607", rows, prices,
+            front_contract="HK.MHI2607",
+        )
+        self.assertIsNotNone(trade_row)
+        self.assertEqual(price, 23024.0)
 
 
 if __name__ == "__main__":

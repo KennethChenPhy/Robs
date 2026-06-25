@@ -161,15 +161,30 @@ class MHImainStrategy:
                 {"price": price, "ma5": self.ma5},
             )
 
+        live_px = float(price) if price is not None else 0.0
+        if live_px <= 0:
+            label = (
+                f"holding long x{position.size}"
+                if position.contracts > 0
+                else f"holding short x{position.size}"
+            )
+            return Signal(
+                "mhimain",
+                Action.HOLD,
+                trade_ticker,
+                f"{label} (no quote for exit checks)",
+                {"price": price},
+            )
+
         if self.entry_price is None:
-            self.entry_price = float(price)
+            self.entry_price = live_px
 
         panic_blocked, panic_reason = self.panic_guard.blocks_cut_loss()
         hold_blocked, hold_reason = self.pnl_baseline.blocks_cut_loss_for_hold(self.position_opened_at)
         if (
             not panic_blocked
             and not hold_blocked
-            and self.pnl_baseline.should_cut_loss(self.entry_price, float(price), position.position)
+            and self.pnl_baseline.should_cut_loss(self.entry_price, live_px, position.position)
         ):
             self._pending_cut_loss = True
             trigger = self.pnl_baseline.cut_loss_trigger()
@@ -178,28 +193,28 @@ class MHImainStrategy:
                     "mhimain",
                     Action.FLAT,
                     trade_ticker,
-                    f"cut loss at {trigger:+.0f}pts (now {self.pnl_baseline.pnl_points(self.entry_price, float(price), position.position):+.0f})",
-                    {"price": price},
+                    f"cut loss at {trigger:+.0f}pts (now {self.pnl_baseline.pnl_points(self.entry_price, live_px, position.position):+.0f})",
+                    {"price": live_px},
                 ),
                 position,
             )
 
-        if self.pnl_baseline.should_take_profit(self.entry_price, float(price), position.position):
+        if self.pnl_baseline.should_take_profit(self.entry_price, live_px, position.position):
             self._pending_take_profit = True
             trigger = self.pnl_baseline.take_profit_trigger()
-            pnl = self.pnl_baseline.pnl_points(self.entry_price, float(price), position.position)
+            pnl = self.pnl_baseline.pnl_points(self.entry_price, live_px, position.position)
             return self._finalize(
                 Signal(
                     "mhimain",
                     Action.FLAT,
                     trade_ticker,
                     f"take profit at {trigger:+.0f}pts (now {pnl:+.0f})",
-                    {"price": price},
+                    {"price": live_px},
                 ),
                 position,
             )
 
-        pnl_status = self.pnl_baseline.status_line(self.entry_price, float(price), position.position)
+        pnl_status = self.pnl_baseline.status_line(self.entry_price, live_px, position.position)
         label = f"holding long x{position.size}" if position.contracts > 0 else f"holding short x{position.size}"
         block_reason = panic_reason if panic_blocked else (hold_reason if hold_blocked else "")
         if block_reason:
@@ -208,9 +223,9 @@ class MHImainStrategy:
                 Action.HOLD,
                 trade_ticker,
                 f"{label} ({pnl_status}) [{block_reason}]",
-                {"price": price},
+                {"price": live_px},
             )
-        return Signal("mhimain", Action.HOLD, trade_ticker, f"{label} ({pnl_status})", {"price": price})
+        return Signal("mhimain", Action.HOLD, trade_ticker, f"{label} ({pnl_status})", {"price": live_px})
 
     def on_exit_cooldown(self, exit_price: float) -> None:
         self.pnl_baseline.record_exit_cooldown(exit_price)

@@ -10,7 +10,12 @@ from zoneinfo import ZoneInfo
 from robs.cli.mhimain import _handle_contract_rollover, _order_line
 from robs.execution.contract_rollover import (
     ContractRolloverManager,
+    HKEXFrontCalendar,
+    HKEXMHISpot,
+    clamp_rollover_target,
     contract_log_label,
+    estimate_mhi_last_trade_day,
+    hkex_spot_startup_message,
     is_held_ahead_of_front,
     is_held_behind_front,
     is_last_trading_day,
@@ -18,6 +23,7 @@ from robs.execution.contract_rollover import (
     is_ltd_expiring_open_window,
     is_ltd_rollover_active,
     is_past_ltd_rollover_deadline,
+    is_plausible_rollover_front,
     next_named_mhi_contract,
     normalize_last_trade_time,
     parse_last_trade_date,
@@ -39,6 +45,7 @@ JUN_29_2026_AT_ROLL = datetime(2026, 6, 29, 11, 58, tzinfo=HK)
 JUN_29_2026_AFTER_ROLL = datetime(2026, 6, 29, 12, 0, tzinfo=HK)
 JUN_29_2026_AFTER_DAY = datetime(2026, 6, 29, 16, 45, tzinfo=HK)
 JUN_29_2026_NIGHT = datetime(2026, 6, 29, 18, 0, tzinfo=HK)
+JUN_25_2026 = datetime(2026, 6, 25, 10, 0, tzinfo=HK)
 LTD_2606 = "2026-06-29 11:58:00"
 MHI_CONTRACTS = [
     ("HK.MHI2606", "2026-06-29 16:00:00"),
@@ -347,6 +354,109 @@ class ContractRolloverLogicTests(unittest.TestCase):
 
     def test_next_named_mhi_contract_year_roll(self) -> None:
         self.assertEqual(next_named_mhi_contract("HK.MHI2512"), "HK.MHI2601")
+
+    def test_estimate_mhi_last_trade_day_june_2026(self) -> None:
+        self.assertEqual(estimate_mhi_last_trade_day(2026, 6), datetime(2026, 6, 29).date())
+
+    def test_hkex_mhi_spot_jun_25_2026(self) -> None:
+        spot = HKEXMHISpot.resolve(now=JUN_25_2026)
+        self.assertIsNotNone(spot)
+        assert spot is not None
+        self.assertEqual(spot.front, "HK.MHI2606")
+        self.assertEqual(spot.next, "HK.MHI2607")
+        self.assertIsNotNone(spot.front_ltd)
+        self.assertIsNotNone(spot.next_ltd)
+
+    def test_hkex_spot_startup_message(self) -> None:
+        spot = HKEXMHISpot.resolve(now=JUN_25_2026)
+        assert spot is not None
+        msg = hkex_spot_startup_message(spot)
+        self.assertIn("MHImain MHI2606", msg)
+        self.assertIn("next MHI2607", msg)
+        self.assertIn("LTD 2026-06-29", msg)
+        self.assertIn("LTD 2026-07-30", msg)
+
+    def test_hkex_calendar_cached_without_opend(self) -> None:
+        cal = HKEXFrontCalendar()
+        a = cal.spot(now=JUN_25_2026)
+        b = cal.spot(now=JUN_25_2026.replace(hour=14))
+        self.assertIs(a, b)
+
+    def test_hkex_calendar_flips_after_ltd_night(self) -> None:
+        cal = HKEXFrontCalendar()
+        morning = cal.spot(now=JUN_29_2026_MORNING)
+        assert morning is not None
+        self.assertEqual(morning.front, "HK.MHI2606")
+        night = cal.spot(now=JUN_29_2026_NIGHT)
+        assert night is not None
+        self.assertEqual(night.front, "HK.MHI2607")
+        self.assertNotEqual(cal.spot_key(), (morning.front, morning.next))
+
+    def test_hkex_calendar_flips_day_after_ltd(self) -> None:
+        cal = HKEXFrontCalendar()
+        morning = cal.spot(now=JUN_29_2026_MORNING)
+        assert morning is not None
+        self.assertEqual(morning.front, "HK.MHI2606")
+        jun_30 = datetime(2026, 6, 30, 10, 0, tzinfo=HK)
+        after = cal.spot(now=jun_30)
+        assert after is not None
+        self.assertEqual(after.front, "HK.MHI2607")
+        self.assertEqual(after.next, "HK.MHI2608")
+
+    def test_catch_up_rollover_when_two_months_behind(self) -> None:
+        """Stale held month two months behind front rolls one step at a time."""
+        jun_30 = datetime(2026, 6, 30, 10, 0, tzinfo=HK)
+        ok, reason = should_rollover(
+            "HK.MHI2605",
+            "HK.MHI2607",
+            "2026-05-29 11:58:00",
+            now=jun_30,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "held_behind_front")
+        self.assertEqual(
+            resolve_rollover_target(
+                "HK.MHI2605",
+                "HK.MHI2607",
+                last_trade_time="2026-05-29 11:58:00",
+                now=jun_30,
+            ),
+            "HK.MHI2606",
+        )
+
+    def test_implausible_broker_front_clamped_to_next_month(self) -> None:
+        """Bad OpenD sim data (2606 held, 2612 front) must roll one month only."""
+        self.assertFalse(is_plausible_rollover_front("HK.MHI2606", "HK.MHI2612"))
+        self.assertEqual(
+            clamp_rollover_target("HK.MHI2606", "HK.MHI2612"),
+            "HK.MHI2607",
+        )
+        target = resolve_rollover_target(
+            "HK.MHI2606",
+            "HK.MHI2612",
+            last_trade_time=LTD_2606,
+            now=JUN_29_2026_NIGHT,
+        )
+        self.assertEqual(target, "HK.MHI2607")
+
+    def test_should_rollover_rejects_multi_month_broker_front(self) -> None:
+        ok, reason = should_rollover(
+            "HK.MHI2606",
+            "HK.MHI2612",
+            LTD_2606,
+            now=JUN_29_2026_NIGHT,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "held_behind_front")
+        self.assertEqual(
+            resolve_rollover_target(
+                "HK.MHI2606",
+                "HK.MHI2612",
+                last_trade_time=LTD_2606,
+                now=JUN_29_2026_NIGHT,
+            ),
+            "HK.MHI2607",
+        )
 
 
 class ContractRolloverHandlerTests(unittest.TestCase):
