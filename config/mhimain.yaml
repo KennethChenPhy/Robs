@@ -57,6 +57,15 @@ mhimain:
   # Re-sync broker position from Futu and print snapshot every N seconds
   position_refresh_sec: 2
 
+  # Idle outside HKEX MHI hours (HKT): no quotes, orders, or broker refresh
+  respect_hkex_hours: true
+  idle_poll_sec: 60   # wake interval while idle to detect session open
+  # After session open, ignore overnight/pre-session data_time for entry staleness (sec)
+  session_open_grace_sec: 1800   # 30 min — covers 09:15–09:45 morning open
+
+  # Flat entries blocked 09:15–09:45 when |day open − prior night close| >= this (index pts)
+  morning_gap_blackout_pts: 200
+
 data:
   poll_interval_sec: 2      # seconds between quote polls
   poll_display_threshold_pts: 10  # only print status when price moves this many pts

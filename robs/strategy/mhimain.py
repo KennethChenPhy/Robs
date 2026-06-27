@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from robs.execution.cut_loss import PositionPnLBaseline
 from robs.execution.panic_pause import PanicGuard
@@ -12,6 +12,9 @@ from robs.execution.position import UnitPositionBook
 from robs.strategy.entry import TrendEntry
 from robs.strategy.rules import Action, Signal
 from robs.strategy.trend import TrendMode, apply_trend_filter
+
+if TYPE_CHECKING:
+    from robs.execution.morning_gap_blackout import MorningGapBlackout
 
 
 @dataclass
@@ -32,6 +35,7 @@ class MHImainStrategy:
     _panic_just_triggered: bool = False
     _order_pending: bool = False
     trend: TrendMode = TrendMode.UNCERTAIN
+    morning_gap: MorningGapBlackout | None = None
 
     @property
     def cooldown(self) -> PositionPnLBaseline:
@@ -147,6 +151,17 @@ class MHImainStrategy:
                 return Signal("mhimain", Action.HOLD, trade_ticker, reason, {"price": price})
             if "cooldown cleared" in reason:
                 self.rearm_entry_if_flat(position)
+
+            if self.morning_gap is not None:
+                gap_blocked, gap_reason = self.morning_gap.blocks_entry()
+                if gap_blocked:
+                    return Signal(
+                        "mhimain",
+                        Action.HOLD,
+                        trade_ticker,
+                        gap_reason,
+                        {"price": price},
+                    )
 
             entry_signal = self._try_flat_entry(price, position)
             if entry_signal is not None:

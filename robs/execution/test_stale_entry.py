@@ -26,13 +26,15 @@ class StaleEntryBlockTests(unittest.TestCase):
     def test_stale_blocks_new_entry_not_close(self) -> None:
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         position = UnitPositionBook(contracts=0)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        strategy = MHImainStrategy.from_config(
+            {"mhimain": {"respect_hkex_hours": False}}, trend=TrendMode.BULL
+        )
         gate = OrderGate()
         stale = QuoteFreshness(poll_stale=True, data_stale=False, threshold_sec=30.0)
 
         with patch("robs.cli.mhimain.execute_unit_order") as mock_order:
             _process_signal(
-                {"mhimain": {}},
+                {"mhimain": {"respect_hkex_hours": False}},
                 MagicMock(),
                 position,
                 strategy,
@@ -49,7 +51,9 @@ class StaleEntryBlockTests(unittest.TestCase):
     def test_stale_allows_close(self) -> None:
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        strategy = MHImainStrategy.from_config(
+            {"mhimain": {"respect_hkex_hours": False}}, trend=TrendMode.BULL
+        )
         strategy.entry_price = 19900.0
         gate = OrderGate()
         stale = QuoteFreshness(data_stale=True, threshold_sec=30.0)
@@ -57,7 +61,7 @@ class StaleEntryBlockTests(unittest.TestCase):
         with patch("robs.cli.mhimain.execute_unit_order") as mock_order:
             mock_order.return_value = {"ok": False, "status": "rejected", "reason": "test"}
             _process_signal(
-                {"mhimain": {}},
+                {"mhimain": {"respect_hkex_hours": False}},
                 MagicMock(),
                 position,
                 strategy,
@@ -74,7 +78,9 @@ class StaleEntryBlockTests(unittest.TestCase):
     def test_force_flat_bypasses_stale(self) -> None:
         risk = RiskManager({"risk": {"max_position_shares": 1}})
         position = UnitPositionBook(contracts=1)
-        strategy = MHImainStrategy.from_config({"mhimain": {}}, trend=TrendMode.BULL)
+        strategy = MHImainStrategy.from_config(
+            {"mhimain": {"respect_hkex_hours": False}}, trend=TrendMode.BULL
+        )
         strategy.entry_price = 19900.0
         gate = OrderGate()
         stale = QuoteFreshness(poll_stale=True, data_stale=True, threshold_sec=30.0)
@@ -82,7 +88,7 @@ class StaleEntryBlockTests(unittest.TestCase):
         with patch("robs.cli.mhimain.execute_unit_order") as mock_order:
             mock_order.return_value = {"ok": False, "status": "rejected", "reason": "test"}
             _process_signal(
-                {"mhimain": {}},
+                {"mhimain": {"respect_hkex_hours": False}},
                 MagicMock(),
                 position,
                 strategy,
@@ -132,7 +138,7 @@ class ExecuteUnitOrderTests(unittest.TestCase):
         position = UnitPositionBook(contracts=0)
         trade = MagicMock()
         result = execute_unit_order(
-            {"mhimain": {}},
+            {"mhimain": {"respect_hkex_hours": False}},
             trade,
             position,
             Action.BUY,

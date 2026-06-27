@@ -51,13 +51,27 @@ def quote_data_age_sec(data_time: str, *, now: datetime | None = None) -> float 
     return max(0.0, (now_hk - parsed).total_seconds())
 
 
-def _data_time_stale(data_time: str, *, threshold: float, now: datetime | None) -> tuple[bool, float | None]:
+def _data_time_stale(
+    data_time: str,
+    *,
+    threshold: float,
+    now: datetime | None,
+    session_start: datetime | None = None,
+    session_open_grace_sec: float = 0.0,
+) -> tuple[bool, float | None]:
     raw = str(data_time or "").strip()
     if not raw or raw.upper() in ("N/A", "NA", "NONE"):
         return True, None
     age = quote_data_age_sec(raw, now=now)
     if age is None:
         return True, None
+    if session_start is not None and session_open_grace_sec > 0:
+        now_hk = (now or datetime.now(HK)).astimezone(HK)
+        parsed = parse_quote_data_time(raw, now=now)
+        if parsed is not None:
+            elapsed = (now_hk - session_start).total_seconds()
+            if 0 <= elapsed <= session_open_grace_sec and parsed < session_start:
+                return False, age
     return age > threshold, age
 
 
@@ -84,6 +98,19 @@ class QuoteFreshness:
         return ""
 
 
+def _hkex_session_open_context(
+    cfg: dict[str, Any], now: datetime | None
+) -> tuple[datetime | None, float]:
+    if not cfg.get("mhimain", {}).get("respect_hkex_hours", True):
+        return None, 0.0
+    from robs.execution.hkex_trading_hours import (
+        current_hkex_session_start,
+        session_open_grace_sec,
+    )
+
+    return current_hkex_session_start(now), session_open_grace_sec(cfg)
+
+
 def assess_quote_freshness(
     cfg: dict[str, Any],
     poll_interval_sec: float,
@@ -98,6 +125,8 @@ def assess_quote_freshness(
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
 
+    session_start, session_grace = _hkex_session_open_context(cfg, now)
+
     poll_stale = False
     if last_successful_poll_at is not None:
         started = last_successful_poll_at
@@ -107,13 +136,25 @@ def assess_quote_freshness(
             started = started.astimezone(timezone.utc)
         poll_age = (now_utc - started).total_seconds()
         poll_stale = poll_age > threshold
+        if poll_stale and session_start is not None and session_grace > 0:
+            now_hk = (now or datetime.now(HK)).astimezone(HK)
+            started_hk = started.astimezone(HK)
+            elapsed = (now_hk - session_start).total_seconds()
+            if 0 <= elapsed <= session_grace and started_hk < session_start:
+                poll_stale = False
 
     if data_time is None:
         data_stale = False
         data_age = None
         data_time_raw = ""
     else:
-        data_stale, data_age = _data_time_stale(data_time, threshold=threshold, now=now)
+        data_stale, data_age = _data_time_stale(
+            data_time,
+            threshold=threshold,
+            now=now,
+            session_start=session_start,
+            session_open_grace_sec=session_grace,
+        )
         data_time_raw = str(data_time or "")
 
     # poll_failed kept for API compatibility; poll gap is always measured from last success.

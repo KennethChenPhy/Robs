@@ -126,6 +126,56 @@ class QuoteStalenessTests(unittest.TestCase):
         fresh = QuoteFreshness(poll_stale=True, data_stale=True)
         self.assertEqual(fresh.status_tag, " [STALE_POLL+DATA]")
 
+    def test_session_open_grace_ignores_overnight_data_time(self) -> None:
+        """At 09:20 HKT, yesterday close data_time must not block flat entries."""
+        now = datetime(2026, 6, 26, 9, 20, 0, tzinfo=HK)
+        cfg = {
+            "mhimain": {"respect_hkex_hours": True, "session_open_grace_sec": 1800},
+            "risk": {"stale_poll_multiplier": 10.0},
+        }
+        fresh = assess_quote_freshness(
+            cfg,
+            1.0,
+            last_successful_poll_at=None,
+            data_time="2026-06-25 16:29:00",
+            now=now.astimezone(timezone.utc),
+        )
+        self.assertFalse(fresh.data_stale)
+        self.assertFalse(fresh.block_entries)
+
+    def test_session_open_grace_expired_still_stale(self) -> None:
+        now = datetime(2026, 6, 26, 10, 0, 0, tzinfo=HK)
+        cfg = {
+            "mhimain": {"respect_hkex_hours": True, "session_open_grace_sec": 1800},
+            "risk": {"stale_poll_multiplier": 10.0},
+        }
+        fresh = assess_quote_freshness(
+            cfg,
+            1.0,
+            last_successful_poll_at=now.astimezone(timezone.utc) - timedelta(seconds=1),
+            data_time="2026-06-25 16:29:00",
+            now=now.astimezone(timezone.utc),
+        )
+        self.assertTrue(fresh.data_stale)
+        self.assertTrue(fresh.block_entries)
+
+    def test_session_open_grace_poll_gap_after_idle(self) -> None:
+        now = datetime(2026, 6, 26, 9, 20, 0, tzinfo=HK)
+        prev = datetime(2026, 6, 25, 16, 30, 0, tzinfo=HK).astimezone(timezone.utc)
+        cfg = {
+            "mhimain": {"respect_hkex_hours": True, "session_open_grace_sec": 1800},
+            "risk": {"stale_poll_multiplier": 10.0},
+        }
+        fresh = assess_quote_freshness(
+            cfg,
+            1.0,
+            last_successful_poll_at=prev,
+            data_time="2026-06-25 16:29:00",
+            now=now.astimezone(timezone.utc),
+        )
+        self.assertFalse(fresh.poll_stale)
+        self.assertFalse(fresh.block_entries)
+
 
 if __name__ == "__main__":
     unittest.main()

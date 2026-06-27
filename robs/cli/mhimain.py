@@ -36,6 +36,11 @@ from robs.execution.contract_rollover import (
     should_rollover,
 )
 from robs.execution.market_guard import allow_market_order
+from robs.execution.hkex_trading_hours import (
+    assess_hkex_mhi_session,
+    next_hkex_mhi_session_open,
+)
+from robs.execution.morning_gap_blackout import MorningGapBlackout
 from robs.execution.mhi_portfolio import (
     BrokerPositionChange,
     MHIPortfolio,
@@ -80,6 +85,18 @@ def _sync_front_context(
         portfolio.update_front_context(spot.front, spot.front_ltd)
     else:
         portfolio.update_front_context(None, None)
+
+
+def _mhimain_session_active(cfg: dict, opend_state: Any | None) -> tuple[bool, str]:
+    mhi = cfg.get("mhimain", {})
+    if not mhi.get("respect_hkex_hours", True):
+        return True, "disabled"
+    return assess_hkex_mhi_session(opend_state=opend_state)
+
+
+def _outside_hkex_trading(cfg: dict) -> bool:
+    """True when respect_hkex_hours is on and local/OpenD says session closed."""
+    return not _mhimain_session_active(cfg, None)[0]
 
 
 def _seed_hkex_calendar_ltd(quote: QuoteClient, calendar: HKEXFrontCalendar) -> None:
@@ -689,6 +706,7 @@ def _process_signal(
     front_contract: str | None = None,
     front_last_trade_time: str | None = None,
     portfolio: MHIPortfolio | None = None,
+    morning_gap: MorningGapBlackout | None = None,
 ) -> None:
     trade_code = order_code or symbol
 
@@ -723,6 +741,9 @@ def _process_signal(
     if signal.action == Action.HOLD:
         return
 
+    if not force_flat and _outside_hkex_trading(cfg):
+        return
+
     if not force_flat and risk.killed:
         LOG.error("kill switch active", extra={"event": "kill_switch", "reason": risk.kill_reason})
         return
@@ -745,6 +766,26 @@ def _process_signal(
             },
         )
         return
+
+    if (
+        not force_flat
+        and not bypass_entry_guards
+        and morning_gap is not None
+        and is_new_entry(position.contracts, signal.action)
+    ):
+        gap_blocked, gap_reason = morning_gap.blocks_entry(datetime.now(timezone.utc))
+        if gap_blocked:
+            LOG.warning(
+                "entry blocked: morning gap",
+                extra={
+                    "event": "entry_blocked",
+                    "reason": "morning_gap_blackout",
+                    "action": signal.action.value,
+                    "detail": gap_reason,
+                },
+            )
+            strategy.rearm_entry_if_flat(position)
+            return
 
     if not skip_auth_check:
         if trade_unlock is not None and not trade_unlock.ensure_authorized(
@@ -2023,6 +2064,7 @@ def main() -> None:
         else data_cfg.get("poll_display_threshold_pts", 20)
     )
     position_refresh_sec = float(mhi_cfg.get("position_refresh_sec", 60))
+    idle_poll_sec = float(mhi_cfg.get("idle_poll_sec", 60))
     ma_period = int(mhi_cfg.get("ma_period", 5))
     endpoints = endpoints_from_config(cfg)
 
@@ -2033,6 +2075,8 @@ def main() -> None:
         trend = TrendMode(str(trend_name).lower())
 
     portfolio = MHIPortfolio.create(cfg, trend=trend, quote_symbol=symbol)
+    morning_gap = MorningGapBlackout.from_config(cfg)
+    portfolio.entry_strategy.morning_gap = morning_gap
     risk = RiskManager(cfg)
 
     LOG.info(
@@ -2144,8 +2188,10 @@ def main() -> None:
             if seed_px is not None:
                 poll_display.seed(code, float(seed_px))
 
+        ok_launch_gs, gs_launch = quote.global_state()
         if (
-            portfolio.is_flat()
+            _mhimain_session_active(cfg, gs_launch if ok_launch_gs else None)[0]
+            and portfolio.is_flat()
             and not risk.killed
             and quote_price is not None
         ):
@@ -2160,6 +2206,23 @@ def main() -> None:
                 portfolio, front_contract, quote, symbol, rows, prices
             )
             if not launch_strat.cooldown.locked:
+                if morning_gap.note_morning_open_if_due(
+                    launch_price,
+                    was_flat=portfolio.is_flat(),
+                ):
+                    LOG.info(
+                        "morning gap blackout — flat entries blocked until 09:45",
+                        extra={
+                            "event": "morning_gap_blackout",
+                            "open": morning_gap.morning_open_price,
+                            "night_close": morning_gap.night_close_price,
+                            "gap_pts": abs(
+                                (morning_gap.morning_open_price or 0)
+                                - (morning_gap.night_close_price or 0)
+                            ),
+                            "threshold_pts": morning_gap.gap_pts,
+                        },
+                    )
                 launch_signal = launch_strat.update(launch_price, launch_pos)
                 if launch_signal.action != Action.HOLD:
                     launch_data_time = str(launch_row.get("data_time", "")) if launch_row is not None else ""
@@ -2189,6 +2252,7 @@ def main() -> None:
                             order_code=launch_order,
                             front_contract=portfolio.front_contract,
                             front_last_trade_time=portfolio.front_last_trade_time,
+                            morning_gap=morning_gap,
                         )
 
         count = 0
@@ -2197,8 +2261,40 @@ def main() -> None:
         last_prices = dict(prices)
         last_rows = dict(rows)
         last_position_refresh = time.monotonic()
+        market_was_idle = False
         try:
             while args.iterations is None or count < args.iterations:
+                ok_gs, gs_state = quote.global_state()
+                session_open, session_reason = _mhimain_session_active(
+                    cfg, gs_state if ok_gs else None,
+                )
+                if not session_open:
+                    if not market_was_idle:
+                        morning_gap.on_session_idle(last_live_price, last_poll_at)
+                        nxt = next_hkex_mhi_session_open()
+                        LOG.info(
+                            "market idle — %s; next open ~%s HKT",
+                            session_reason,
+                            nxt.strftime("%Y-%m-%d %H:%M"),
+                            extra={
+                                "event": "market_idle",
+                                "reason": session_reason,
+                                "next_open_hkt": nxt.isoformat(),
+                            },
+                        )
+                        market_was_idle = True
+                    time.sleep(idle_poll_sec)
+                    count += 1
+                    continue
+                if market_was_idle:
+                    LOG.info(
+                        "market active — %s",
+                        session_reason,
+                        extra={"event": "market_active", "reason": session_reason},
+                    )
+                    market_was_idle = False
+                    last_poll_at = None
+
                 if is_continuous_mhi(symbol):
                     spot, hkex_spot_key = _refresh_hkex_spot_if_changed(
                         quote, hkex_calendar, hkex_spot_key,
@@ -2307,6 +2403,26 @@ def main() -> None:
                 )
                 last_poll_at = poll_now
                 now_mono = time.monotonic()
+                morning_gap.note_night_session_price(price, poll_now)
+                if price is not None and price > 0:
+                    if morning_gap.note_morning_open_if_due(
+                        price,
+                        was_flat=portfolio.is_flat(),
+                        now=poll_now,
+                    ):
+                        LOG.info(
+                            "morning gap blackout — flat entries blocked until 09:45",
+                            extra={
+                                "event": "morning_gap_blackout",
+                                "open": morning_gap.morning_open_price,
+                                "night_close": morning_gap.night_close_price,
+                                "gap_pts": abs(
+                                    (morning_gap.morning_open_price or 0)
+                                    - (morning_gap.night_close_price or 0)
+                                ),
+                                "threshold_pts": morning_gap.gap_pts,
+                            },
+                        )
                 if quote_fresh.block_entries:
                     _log_quote_stale(quote_fresh, event="quote_stale")
 
@@ -2362,6 +2478,7 @@ def main() -> None:
                     if entry_strat.consume_panic_trigger():
                         _alert_panic_pause(entry_strat, entry_price)
                     cooldown_tag = _portfolio_tags(portfolio, order_gate) + quote_fresh.status_tag
+                    cooldown_tag += morning_gap.status_tag(poll_now)
                     status = signal.reason
                     if signal.action != Action.HOLD:
                         status = f"{contract_log_label(entry_order)} {signal.action.value}: {signal.reason}"
@@ -2381,6 +2498,7 @@ def main() -> None:
                         front_contract=portfolio.front_contract,
                         front_last_trade_time=portfolio.front_last_trade_time,
                         portfolio=portfolio,
+                        morning_gap=morning_gap,
                     )
                     portfolio._note_entry_book_code(
                         entry_order if portfolio.entry_position.contracts != 0 else None
