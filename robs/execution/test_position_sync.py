@@ -17,6 +17,8 @@ from robs.execution.position_sync import (
     fetch_broker_position,
     fetch_broker_position_for_code,
     refresh_broker_position,
+    _broker_position_from_row,
+    _pick_cost,
     _signed_contracts_from_row,
 )
 from robs.strategy.mhimain import MHImainStrategy
@@ -315,6 +317,59 @@ class SignedContractsFromRowTests(unittest.TestCase):
             }
         )
         self.assertEqual(_signed_contracts_from_row(row), -6)
+
+
+class BrokerNumericParsingTests(unittest.TestCase):
+    def test_pick_cost_ignores_na_strings(self) -> None:
+        row = pd.Series(
+            {
+                "cost_price": "N/A",
+                "average_cost": "N/A",
+                "diluted_cost": "N/A",
+            }
+        )
+        self.assertIsNone(_pick_cost(row))
+
+    def test_flat_row_with_na_fields(self) -> None:
+        row = pd.Series(
+            {
+                "code": "HK.MHI2606",
+                "qty": 0,
+                "position_side": "N/A",
+                "cost_price": "N/A",
+                "nominal_price": "N/A",
+                "pl_val": "N/A",
+            }
+        )
+        broker = _broker_position_from_row(row, "HK.MHI2606", 20000.0)
+        self.assertEqual(broker.contracts, 0)
+        self.assertIsNone(broker.entry_price)
+        self.assertIsNone(broker.pnl_val)
+
+    def test_fetch_mhi_legs_skips_flat_na_row(self) -> None:
+        trade = MagicMock()
+        trade._ctx.position_list_query.return_value = (
+            0,
+            pd.DataFrame(
+                [
+                    {
+                        "code": "HK.MHI2606",
+                        "qty": 0,
+                        "position_side": "N/A",
+                        "cost_price": "N/A",
+                        "nominal_price": "N/A",
+                        "pl_val": "N/A",
+                    }
+                ]
+            ),
+        )
+        legs = fetch_broker_mhi_legs(
+            trade,
+            "HK.MHImain",
+            {"trd_env": "SIMULATE"},
+            quote_prices={"HK.MHImain": 20000.0},
+        )
+        self.assertEqual(legs, [])
 
 
 if __name__ == "__main__":

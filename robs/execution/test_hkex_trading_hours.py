@@ -10,6 +10,7 @@ from robs.execution.hkex_trading_hours import (
     assess_hkex_mhi_session,
     current_hkex_session_start,
     is_hkex_mhi_trading_session,
+    next_hkex_mhi_session_open,
     opend_hkfuture_is_open,
     session_open_grace_sec,
 )
@@ -83,6 +84,27 @@ class HKEXTradingHoursTests(unittest.TestCase):
         self.assertTrue(in_morning_gap_entry_blackout_window(inside))
         outside = datetime(2026, 6, 29, 10, 0, tzinfo=HK)
         self.assertFalse(in_morning_gap_entry_blackout_window(outside))
+
+    def test_next_open_saturday_evening_is_monday_0915(self) -> None:
+        """Regression: 15-min stepping from :43 produced 09:28 instead of 09:15."""
+        sat = datetime(2026, 6, 27, 17, 43, 17, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(sat)
+        self.assertEqual(nxt, datetime(2026, 6, 29, 9, 15, tzinfo=HK))
+
+    def test_next_open_lunch_gap_is_afternoon_1300(self) -> None:
+        mon = datetime(2026, 6, 29, 12, 30, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(mon)
+        self.assertEqual(nxt, datetime(2026, 6, 29, 13, 0, tzinfo=HK))
+
+    def test_next_open_day_close_gap_is_night_1715(self) -> None:
+        mon = datetime(2026, 6, 29, 16, 35, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(mon)
+        self.assertEqual(nxt, datetime(2026, 6, 29, 17, 15, tzinfo=HK))
+
+    def test_next_open_pre_morning_is_same_day_0915(self) -> None:
+        mon = datetime(2026, 6, 29, 8, 0, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(mon)
+        self.assertEqual(nxt, datetime(2026, 6, 29, 9, 15, tzinfo=HK))
 
 
 if __name__ == "__main__":

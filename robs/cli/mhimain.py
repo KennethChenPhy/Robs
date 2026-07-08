@@ -41,6 +41,7 @@ from robs.execution.hkex_trading_hours import (
     next_hkex_mhi_session_open,
 )
 from robs.execution.morning_gap_blackout import MorningGapBlackout
+from robs.execution.daily_ma_refresh import refresh_uncertain_daily_ma
 from robs.execution.mhi_portfolio import (
     BrokerPositionChange,
     MHIPortfolio,
@@ -2066,6 +2067,7 @@ def main() -> None:
     position_refresh_sec = float(mhi_cfg.get("position_refresh_sec", 60))
     idle_poll_sec = float(mhi_cfg.get("idle_poll_sec", 60))
     ma_period = int(mhi_cfg.get("ma_period", 5))
+    ma_refresh_sec = float(mhi_cfg.get("ma_refresh_sec", 600))
     endpoints = endpoints_from_config(cfg)
 
     if args.prompt_trend:
@@ -2089,6 +2091,7 @@ def main() -> None:
             "poll_interval_sec": poll_interval,
             "poll_display_threshold_pts": poll_display_threshold,
             "ma_period": ma_period,
+            "ma_refresh_sec": ma_refresh_sec,
             "stale_threshold_sec": stale_threshold_sec(cfg, poll_interval),
         },
     )
@@ -2206,6 +2209,18 @@ def main() -> None:
                 portfolio, front_contract, quote, symbol, rows, prices
             )
             if not launch_strat.cooldown.locked:
+                if launch_strat.trend == TrendMode.UNCERTAIN:
+                    refresh_uncertain_daily_ma(
+                        quote,
+                        launch_strat,
+                        symbol,
+                        ma_period,
+                        entry_armed=True,
+                        last_refresh_mono=None,
+                        now_mono=time.monotonic(),
+                        refresh_sec=ma_refresh_sec,
+                        force=True,
+                    )
                 if morning_gap.note_morning_open_if_due(
                     launch_price,
                     was_flat=portfolio.is_flat(),
@@ -2261,6 +2276,7 @@ def main() -> None:
         last_prices = dict(prices)
         last_rows = dict(rows)
         last_position_refresh = time.monotonic()
+        last_ma_refresh_mono: float | None = None
         market_was_idle = False
         try:
             while args.iterations is None or count < args.iterations:
@@ -2273,13 +2289,12 @@ def main() -> None:
                         morning_gap.on_session_idle(last_live_price, last_poll_at)
                         nxt = next_hkex_mhi_session_open()
                         LOG.info(
-                            "market idle — %s; next open ~%s HKT",
+                            "market idle — %s",
                             session_reason,
-                            nxt.strftime("%Y-%m-%d %H:%M"),
                             extra={
                                 "event": "market_idle",
                                 "reason": session_reason,
-                                "next_open_hkt": nxt.isoformat(),
+                                "next_open_hkt": format_hk_log_ts(nxt),
                             },
                         )
                         market_was_idle = True
@@ -2294,6 +2309,7 @@ def main() -> None:
                     )
                     market_was_idle = False
                     last_poll_at = None
+                    last_ma_refresh_mono = None
 
                 if is_continuous_mhi(symbol):
                     spot, hkex_spot_key = _refresh_hkex_spot_if_changed(
@@ -2473,6 +2489,16 @@ def main() -> None:
                         entry_row,
                     ) = _flat_entry_context(
                         portfolio, front_contract, quote, symbol, rows, prices
+                    )
+                    last_ma_refresh_mono = refresh_uncertain_daily_ma(
+                        quote,
+                        entry_strat,
+                        symbol,
+                        ma_period,
+                        entry_armed=entry_strat.entry_armed,
+                        last_refresh_mono=last_ma_refresh_mono,
+                        now_mono=now_mono,
+                        refresh_sec=ma_refresh_sec,
                     )
                     signal = entry_strat.update(entry_price, entry_pos)
                     if entry_strat.consume_panic_trigger():

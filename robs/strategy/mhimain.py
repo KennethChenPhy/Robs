@@ -95,6 +95,10 @@ class MHImainStrategy:
         """Broker sync detected flat (e.g. manual close). Apply post-exit cooldown."""
         self.on_exit_cooldown(exit_price)
 
+    @property
+    def entry_armed(self) -> bool:
+        return self._entry_armed
+
     def rearm_entry_if_flat(self, position: UnitPositionBook) -> None:
         if position.contracts == 0 and not self.pnl_baseline.locked:
             self._entry_armed = True
@@ -103,14 +107,14 @@ class MHImainStrategy:
         if not self._entry_armed:
             return None
 
-        entry = TrendEntry(trend=self.trend, ma5=self.ma5)
+        entry = TrendEntry(trend=self.trend, ma5=self.ma5, ma_period=self.ma_period)
         raw = entry.evaluate(price, self.symbol)
         if raw is None:
             return Signal(
                 "mhimain",
                 Action.HOLD,
                 self.symbol,
-                "uncertain entry blocked: MA5 unavailable",
+                f"uncertain entry blocked: MA{self.ma_period} unavailable",
                 {"price": price},
             )
         if raw.action == Action.HOLD:
@@ -167,7 +171,9 @@ class MHImainStrategy:
             if entry_signal is not None:
                 return entry_signal
 
-            ma_info = f" MA5={self.ma5:.1f}" if self.ma5 is not None else ""
+            ma_info = (
+                f" MA{self.ma_period}={self.ma5:.1f}" if self.ma5 is not None else ""
+            )
             return Signal(
                 "mhimain",
                 Action.HOLD,

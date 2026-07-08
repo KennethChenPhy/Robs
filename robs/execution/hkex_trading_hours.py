@@ -138,19 +138,18 @@ def session_open_grace_sec(cfg: dict[str, Any]) -> float:
 
 
 def next_hkex_mhi_session_open(ref: datetime | None = None) -> datetime:
-    """Next session open (HKT) at or after ref (for idle logging)."""
+    """Next scheduled session open (HKT) strictly after ref."""
     dt = _as_hk(ref)
-    for minutes in range(0, 8 * 24 * 60, 15):
-        candidate = dt + timedelta(minutes=minutes)
-        if is_hkex_mhi_trading_session(candidate):
-            t = candidate.timetz()
-            if t < DAY_MORNING_OPEN:
-                return candidate.replace(hour=9, minute=15, second=0, microsecond=0)
-            if DAY_MORNING_CLOSE <= t < DAY_AFTERNOON_OPEN:
-                return candidate.replace(hour=13, minute=0, second=0, microsecond=0)
-            if DAY_AFTERNOON_CLOSE <= t < NIGHT_OPEN:
-                return candidate.replace(hour=17, minute=15, second=0, microsecond=0)
-            if t >= NIGHT_CLOSE and t < DAY_MORNING_OPEN:
-                return candidate.replace(hour=9, minute=15, second=0, microsecond=0)
-            return candidate.replace(second=0, microsecond=0)
-    return dt + timedelta(hours=1)
+    for day_offset in range(0, 8):
+        d = dt.date() + timedelta(days=day_offset)
+        if d.weekday() > 4:
+            continue
+        for open_time in (DAY_MORNING_OPEN, DAY_AFTERNOON_OPEN, NIGHT_OPEN):
+            open_dt = datetime.combine(d, open_time, tzinfo=HK)
+            if open_dt > dt:
+                return open_dt
+    return datetime.combine(
+        dt.date() + timedelta(days=1),
+        DAY_MORNING_OPEN,
+        tzinfo=HK,
+    )

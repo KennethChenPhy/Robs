@@ -37,11 +37,30 @@ def _trd_env(cfg: dict[str, Any]) -> TrdEnv:
     return TrdEnv.REAL if trd_env_name(cfg) == "REAL" else TrdEnv.SIMULATE
 
 
+_NON_NUMERIC = frozenset({"N/A", "NA", "NONE", "UNKNOWN", ""})
+
+
+def _parse_float(val: Any) -> float | None:
+    """Parse Futu field; None for N/A, blank, NaN, or non-numeric."""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if val.strip().upper() in _NON_NUMERIC:
+            return None
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        return None
+    if out != out:
+        return None
+    return out
+
+
 def _pick_cost(row: Any) -> float | None:
     for col in ("cost_price", "average_cost", "diluted_cost"):
-        val = row.get(col)
-        if val is not None and val == val and float(val) > 0:
-            return float(val)
+        val = _parse_float(row.get(col))
+        if val is not None and val > 0:
+            return val
     return None
 
 
@@ -63,26 +82,21 @@ def _infer_signed_when_side_unknown(row: Any, n: int) -> int:
     """Best-effort short vs long when Futu reports position_side N/A."""
     if n == 0:
         return 0
-    qty_f = float(row.get("qty", 0) or 0)
+    qty_f = _parse_float(row.get("qty")) or 0.0
     can_sell = row.get("can_sell_qty")
-    if can_sell is not None and can_sell == can_sell and qty_f > 0:
-        cs = float(can_sell)
-        if cs == 0:
-            return -n
-        if cs >= qty_f:
-            return n
+    if can_sell is not None:
+        cs = _parse_float(can_sell)
+        if cs is not None and qty_f > 0:
+            if cs == 0:
+                return -n
+            if cs >= qty_f:
+                return n
     entry = _pick_cost(row)
-    nominal = row.get("nominal_price")
+    nominal = _parse_float(row.get("nominal_price"))
     for pl_key in ("pl_val", "unrealized_pl"):
-        pl_val = row.get(pl_key)
-        if (
-            entry is not None
-            and nominal is not None
-            and nominal == nominal
-            and pl_val is not None
-            and pl_val == pl_val
-        ):
-            entry_f, nom_f, pl_f = float(entry), float(nominal), float(pl_val)
+        pl_val = _parse_float(row.get(pl_key))
+        if entry is not None and nominal is not None and pl_val is not None:
+            entry_f, nom_f, pl_f = entry, nominal, pl_val
             if pl_f < 0 and nom_f > entry_f:
                 return -n
             if pl_f < 0 and nom_f < entry_f:
@@ -101,7 +115,7 @@ def _infer_signed_when_side_unknown(row: Any, n: int) -> int:
 
 def _signed_contracts_from_row(row: Any) -> int:
     """Signed contracts from a Futu position row (handles N/A position_side)."""
-    qty = float(row.get("qty", 0) or 0)
+    qty = _parse_float(row.get("qty")) or 0.0
     side = str(row.get("position_side", "") or "")
     side_up = side.upper().strip()
     if side_up not in ("", "N/A", "NONE", "UNKNOWN"):
@@ -228,13 +242,12 @@ def _broker_position_from_row(
 ) -> BrokerPosition:
     actual_code = str(row.get("code", symbol))
     signed = _signed_contracts_from_row(row)
-    qty = float(row.get("qty", 0) or 0)
+    qty = _parse_float(row.get("qty")) or 0.0
     entry = _pick_cost(row)
     if quote_price is not None:
         current = quote_price
     else:
-        nominal = row.get("nominal_price")
-        current = float(nominal) if nominal is not None and nominal == nominal else None
+        current = _parse_float(row.get("nominal_price"))
 
     pnl_points = 0.0
     if entry is not None and current is not None and signed != 0:
@@ -243,8 +256,7 @@ def _broker_position_from_row(
         else:
             pnl_points = entry - current
 
-    pl_val = row.get("pl_val")
-    pnl_val = float(pl_val) if pl_val is not None and pl_val == pl_val else None
+    pnl_val = _parse_float(row.get("pl_val"))
 
     return BrokerPosition(
         code=actual_code,

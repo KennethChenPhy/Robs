@@ -13,6 +13,10 @@ from robs.strategy.trend import TrendMode
 class TrendEntry:
     trend: TrendMode
     ma5: float | None = None
+    ma_period: int = 5
+
+    def _ma_label(self) -> str:
+        return f"MA{self.ma_period}"
 
     def evaluate(self, price: float, symbol: str) -> Signal | None:
         if self.trend == TrendMode.BULL:
@@ -41,7 +45,7 @@ class TrendEntry:
                 "trend_entry",
                 Action.BUY,
                 symbol,
-                f"uncertain: price {price:.1f} < MA5 {self.ma5:.1f} → long",
+                f"uncertain: price {price:.1f} < {self._ma_label()} {self.ma5:.1f} → long",
                 {"price": price, "ma5": self.ma5, "trend": self.trend.value},
             )
         if price > self.ma5:
@@ -49,7 +53,7 @@ class TrendEntry:
                 "trend_entry",
                 Action.SELL,
                 symbol,
-                f"uncertain: price {price:.1f} > MA5 {self.ma5:.1f} → short",
+                f"uncertain: price {price:.1f} > {self._ma_label()} {self.ma5:.1f} → short",
                 {"price": price, "ma5": self.ma5, "trend": self.trend.value},
             )
 
@@ -57,6 +61,6 @@ class TrendEntry:
             "trend_entry",
             Action.HOLD,
             symbol,
-            f"uncertain: price {price:.1f} == MA5 {self.ma5:.1f}",
+            f"uncertain: price {price:.1f} == {self._ma_label()} {self.ma5:.1f}",
             {"price": price, "ma5": self.ma5},
         )
