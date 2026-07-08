@@ -1711,8 +1711,15 @@ def _refresh_broker_positions_if_due(
     """Sync entry + legs from broker every refresh_sec (flat or holding)."""
     if now_mono - last_refresh_mono < refresh_sec:
         return last_refresh_mono
-    broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
-    changed_codes = portfolio.refresh_from_broker(broker_legs, risk)
+    try:
+        broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
+        changed_codes = portfolio.refresh_from_broker(broker_legs, risk)
+    except Exception as exc:
+        LOG.warning(
+            "broker position refresh failed",
+            extra={"event": "broker_refresh_failed", "error": str(exc)},
+        )
+        return last_refresh_mono
     if changed_codes:
         if order_gate is not None and order_gate.pending and order_gate.order_code:
             pending_code = order_gate.order_code.upper()

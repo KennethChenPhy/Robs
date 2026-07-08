@@ -346,6 +346,23 @@ class BrokerNumericParsingTests(unittest.TestCase):
         self.assertIsNone(broker.entry_price)
         self.assertIsNone(broker.pnl_val)
 
+    def test_open_row_with_na_cost_does_not_crash(self) -> None:
+        """Manual open in Futu can briefly return N/A cost fields."""
+        row = pd.Series(
+            {
+                "code": "HK.MHI2606",
+                "qty": 1.0,
+                "position_side": "LONG",
+                "cost_price": "N/A",
+                "nominal_price": "N/A",
+                "pl_val": "N/A",
+            }
+        )
+        broker = _broker_position_from_row(row, "HK.MHI2606", 23050.0)
+        self.assertEqual(broker.contracts, 1)
+        self.assertIsNone(broker.entry_price)
+        self.assertEqual(broker.current_price, 23050.0)
+
     def test_fetch_mhi_legs_skips_flat_na_row(self) -> None:
         trade = MagicMock()
         trade._ctx.position_list_query.return_value = (
