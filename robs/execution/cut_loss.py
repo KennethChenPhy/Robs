@@ -113,7 +113,7 @@ class PositionPnLBaseline:
         self.cooldown_until = None
 
     def record_exit_cooldown(self, exit_price: float) -> None:
-        """After exit: lock entries until min hours, then move or max trading hours."""
+        """After exit: lock until (min hours AND move) OR trading hours elapse."""
         now = datetime.now(timezone.utc)
         self.locked = True
         self.cooldown_ref_price = exit_price
@@ -137,24 +137,30 @@ class PositionPnLBaseline:
 
         now = datetime.now(timezone.utc)
         elapsed_h = self._cooldown_hours_elapsed(now)
+        move = abs(price - self.cooldown_ref_price)
+        ref = self.cooldown_ref_price
 
-        if self.cooldown_until is not None and now >= self.cooldown_until:
+        trading_hours_ok = (
+            self.cooldown_until is not None and now >= self.cooldown_until
+        )
+        min_hours_ok = elapsed_h >= self.reentry_minimum_hours
+        move_ok = move >= self.reentry_move_pts
+
+        if trading_hours_ok:
             self._clear_cooldown()
             return False, f"cooldown cleared after {self.reentry_trading_hours:.0f} trading hours"
 
-        move = abs(price - self.cooldown_ref_price)
-        min_hours_left = max(0.0, self.reentry_minimum_hours - elapsed_h)
+        if min_hours_ok and move_ok:
+            self._clear_cooldown()
+            return False, f"cooldown cleared after {move:.0f}pt move"
 
+        min_hours_left = max(0.0, self.reentry_minimum_hours - elapsed_h)
         if min_hours_left > 0:
             return (
                 True,
                 f"cooldown: {min_hours_left:.1f}h min wait before re-entry "
-                f"(move {move:.0f}/{self.reentry_move_pts:.0f}pt from {self.cooldown_ref_price:.1f})",
+                f"(move {move:.0f}/{self.reentry_move_pts:.0f}pt from {ref:.1f})",
             )
-
-        if move >= self.reentry_move_pts:
-            self._clear_cooldown()
-            return False, f"cooldown cleared after {move:.0f}pt move"
 
         need_pts = self.reentry_move_pts - move
         hours_left = 0.0
@@ -162,8 +168,7 @@ class PositionPnLBaseline:
             hours_left = max(0.0, (self.cooldown_until - now).total_seconds() / 3600.0)
         return (
             True,
-            f"cooldown: need {need_pts:.0f}pt more or {hours_left:.1f}h left "
-            f"(from {self.cooldown_ref_price:.1f})",
+            f"cooldown: need {need_pts:.0f}pt more or {hours_left:.1f}h left (from {ref:.1f})",
         )
 
 

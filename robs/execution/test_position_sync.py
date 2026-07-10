@@ -142,6 +142,33 @@ class ReentryCooldownTests(unittest.TestCase):
         self.assertFalse(blocked)
         self.assertIn("cleared", reason)
 
+    def test_insufficient_move_after_minimum_stays_blocked(self) -> None:
+        bl = PositionPnLBaseline(
+            reentry_move_pts=240,
+            reentry_minimum_hours=4,
+            reentry_trading_hours=24,
+        )
+        bl.record_exit_cooldown(24412.0)
+        bl.cooldown_started_at = datetime.now(timezone.utc) - timedelta(hours=4, seconds=1)
+
+        blocked, reason = bl.blocks_entry(24292.0)
+        self.assertTrue(blocked)
+        self.assertIn("need", reason)
+        self.assertTrue(bl.locked)
+
+    def test_trading_hours_clear_without_move(self) -> None:
+        bl = PositionPnLBaseline(
+            reentry_move_pts=240,
+            reentry_minimum_hours=4,
+            reentry_trading_hours=24,
+        )
+        bl.record_exit_cooldown(24412.0)
+        bl.cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        blocked, reason = bl.blocks_entry(24292.0)
+        self.assertFalse(blocked)
+        self.assertIn("trading hours", reason)
+
 
 class NonMhiBrokerFetchTests(unittest.TestCase):
     def test_fetch_broker_position_for_code_rejects_hti(self) -> None:

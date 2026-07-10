@@ -29,13 +29,15 @@ mhimain:
 
   # P/L exits from entry price (per contract): cut at -cut_loss_pts, profit at +take_profit_pts
   cut_loss_pts: 240         # close when P/L is launch − 200 pts
-  take_profit_pts: 400      # close when P/L is launch + 400 pts
-  cut_loss_min_hold_hours: 24  # no cut loss until position held this long (take profit still allowed)
+  take_profit_pts: 420      # close when P/L is launch + 400 pts
+  cut_loss_min_hold_hours: 36  # no cut loss until position held this long (take profit still allowed)
 
-  # Re-entry block after any exit; clears when ALL apply:
-  reentry_minimum_hours: 4   #   always wait at least this long (even if price moves enough)
-  reentry_move_pts: 240      #   then price moves 300 pts from exit, or
-  reentry_trading_hours: 24   #   reentry_trading_hours elapse (whichever clears first after minimum)
+  # Re-entry block after any exit; clears when:
+  #   (reentry_minimum_hours elapsed AND price moves reentry_move_pts from exit), OR
+  #   reentry_trading_hours elapse (wall-clock from exit)
+  reentry_minimum_hours: 4
+  reentry_move_pts: 400
+  reentry_trading_hours: 48
 
   # Panic pause: block cut loss (not take profit) after a violent move
   panic_move_pts: 150
