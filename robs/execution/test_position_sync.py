@@ -5,10 +5,12 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from robs.execution.cut_loss import PositionPnLBaseline
+from robs.execution.hkex_trading_hours import hkex_trading_hours_add
 from robs.execution.position import UnitPositionBook
 from robs.execution.position_sync import (
     BrokerPosition,
@@ -116,6 +118,8 @@ class PositionSyncTests(unittest.TestCase):
 
 
 class ReentryCooldownTests(unittest.TestCase):
+    HK = ZoneInfo("Asia/Hong_Kong")
+
     def test_move_does_not_clear_before_minimum_hours(self) -> None:
         bl = PositionPnLBaseline(
             reentry_move_pts=300,
@@ -123,9 +127,12 @@ class ReentryCooldownTests(unittest.TestCase):
             reentry_trading_hours=24,
         )
         bl.record_exit_cooldown(23500.0)
-        bl.cooldown_started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        started = datetime(2026, 6, 29, 10, 0, tzinfo=self.HK)
+        bl.cooldown_started_at = started
 
-        blocked, reason = bl.blocks_entry(23900.0)
+        blocked, reason = bl.blocks_entry(
+            23900.0, now=datetime(2026, 6, 29, 11, 0, tzinfo=self.HK),
+        )
         self.assertTrue(blocked)
         self.assertIn("min wait", reason)
 
@@ -136,9 +143,12 @@ class ReentryCooldownTests(unittest.TestCase):
             reentry_trading_hours=24,
         )
         bl.record_exit_cooldown(23500.0)
-        bl.cooldown_started_at = datetime.now(timezone.utc) - timedelta(hours=5)
+        started = datetime(2026, 6, 29, 10, 0, tzinfo=self.HK)
+        bl.cooldown_started_at = started
 
-        blocked, reason = bl.blocks_entry(23900.0)
+        blocked, reason = bl.blocks_entry(
+            23900.0, now=datetime(2026, 6, 29, 15, 0, tzinfo=self.HK),
+        )
         self.assertFalse(blocked)
         self.assertIn("cleared", reason)
 
@@ -149,9 +159,12 @@ class ReentryCooldownTests(unittest.TestCase):
             reentry_trading_hours=24,
         )
         bl.record_exit_cooldown(24412.0)
-        bl.cooldown_started_at = datetime.now(timezone.utc) - timedelta(hours=4, seconds=1)
+        started = datetime(2026, 6, 29, 10, 0, tzinfo=self.HK)
+        bl.cooldown_started_at = started
 
-        blocked, reason = bl.blocks_entry(24292.0)
+        blocked, reason = bl.blocks_entry(
+            24292.0, now=datetime(2026, 6, 29, 15, 0, tzinfo=self.HK),
+        )
         self.assertTrue(blocked)
         self.assertIn("need", reason)
         self.assertTrue(bl.locked)
@@ -163,11 +176,57 @@ class ReentryCooldownTests(unittest.TestCase):
             reentry_trading_hours=24,
         )
         bl.record_exit_cooldown(24412.0)
-        bl.cooldown_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        started = datetime(2026, 6, 29, 10, 0, tzinfo=self.HK)
+        bl.cooldown_started_at = started
+        bl.cooldown_until = hkex_trading_hours_add(started, 24)
 
-        blocked, reason = bl.blocks_entry(24292.0)
+        blocked, reason = bl.blocks_entry(
+            24292.0, now=bl.cooldown_until + timedelta(minutes=1),
+        )
         self.assertFalse(blocked)
         self.assertIn("trading hours", reason)
+
+    def test_reentry_trading_hours_expiry_uses_hkex_hours(self) -> None:
+        bl = PositionPnLBaseline(reentry_trading_hours=48)
+        started = datetime(2026, 6, 29, 10, 0, tzinfo=self.HK)
+        bl.cooldown_started_at = started
+        bl.cooldown_until = hkex_trading_hours_add(started, 48)
+        wall_expiry = started + timedelta(hours=48)
+        self.assertGreater(bl.cooldown_until, wall_expiry)
+
+    def test_public_holiday_does_not_count_toward_minimum(self) -> None:
+        bl = PositionPnLBaseline(
+            reentry_move_pts=500,
+            reentry_minimum_hours=20,
+            reentry_trading_hours=48,
+        )
+        started = datetime(2026, 9, 30, 10, 0, tzinfo=self.HK)
+        bl.record_exit_cooldown(23500.0)
+        bl.cooldown_started_at = started
+        bl.cooldown_until = hkex_trading_hours_add(started, 48)
+        holiday_afternoon = datetime(2026, 10, 1, 15, 0, tzinfo=self.HK)
+        elapsed = bl._cooldown_trading_hours_elapsed(holiday_afternoon)
+        wall_h = (holiday_afternoon - started).total_seconds() / 3600.0
+        self.assertLess(elapsed, wall_h)
+        blocked, _ = bl.blocks_entry(20000.0, now=holiday_afternoon)
+        self.assertTrue(blocked)
+
+    def test_take_profit_at_1446_stays_blocked_with_hkex_cooldown(self) -> None:
+        """Regression: wall-clock 4h after Fri 10:46 must not clear 4h HKEX minimum."""
+        bl = PositionPnLBaseline(
+            reentry_minimum_hours=4,
+            reentry_move_pts=400,
+            reentry_trading_hours=48,
+        )
+        exit_t = datetime(2026, 7, 10, 10, 46, 37, tzinfo=self.HK)
+        check_t = datetime(2026, 7, 10, 14, 46, 38, tzinfo=self.HK)
+        bl.record_exit_cooldown(24412.0)
+        bl.cooldown_started_at = exit_t
+        bl.cooldown_until = hkex_trading_hours_add(exit_t, 48)
+
+        blocked, reason = bl.blocks_entry(24292.0, now=check_t)
+        self.assertTrue(blocked)
+        self.assertIn("min wait", reason)
 
 
 class NonMhiBrokerFetchTests(unittest.TestCase):

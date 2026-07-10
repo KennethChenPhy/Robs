@@ -910,12 +910,14 @@ def _finalize_filled_order(
     order_gate: OrderGate,
     *,
     fill_price: float | None = None,
+    book: str = "entry",
 ) -> None:
     action = order_gate.signal_action
     exit_price = fill_price if fill_price is not None else price
     entry_before = strategy.entry_price
     close_side = order_gate.side
     fill_qty = int(order_gate.qty)
+    trade_code = order_gate.order_code
 
     order_gate.clear()
     strategy.set_order_pending(False)
@@ -937,12 +939,19 @@ def _finalize_filled_order(
         position.reset_after_flat()
         risk.position_shares = 0
         strategy.rearm_entry_if_flat(position)
+        if strategy.pnl_baseline.locked:
+            _log_reentry_cooldown_expiry(strategy, book=book, contract=trade_code)
     elif action in (Action.BUY, Action.SELL):
         if position.contracts == 0 and close_side is not None:
             position.on_fill(close_side, fill_qty)
         if position.contracts != 0:
             strategy.on_new_entry(exit_price)
             risk.position_shares = position.contracts
+            _log_cut_loss_min_hold_expiry(
+                strategy,
+                book=book,
+                contract=trade_code,
+            )
 
 
 def _cancel_pending_entry(
@@ -1815,6 +1824,10 @@ def _report_broker_position_changes(
                 "book": change.book,
             },
         )
+        if change.contracts != 0:
+            _log_cut_loss_min_hold_expiry(strategy, book=change.book, contract=code)
+        elif strategy.pnl_baseline.locked:
+            _log_reentry_cooldown_expiry(strategy, book=change.book, contract=code)
         if change.book == "leg" and change.contracts == 0:
             portfolio.remove_if_flat(code)
 
@@ -1919,6 +1932,81 @@ def _position_label(contracts: int) -> str:
     return "flat (0)"
 
 
+def _cut_loss_min_hold_line(strategy: MHImainStrategy) -> str | None:
+    if strategy.position_opened_at is None:
+        return None
+    expires = strategy.pnl_baseline.cut_loss_min_hold_expires_at(strategy.position_opened_at)
+    if expires is None:
+        return None
+    hours = strategy.pnl_baseline.cut_loss_min_hold_hours
+    return (
+        f"cut loss allowed after {format_hk_log_ts(expires)} "
+        f"({hours:.0f}h HKEX trading)"
+    )
+
+
+def _log_cut_loss_min_hold_expiry(
+    strategy: MHImainStrategy,
+    *,
+    book: str,
+    contract: str | None = None,
+) -> None:
+    line = _cut_loss_min_hold_line(strategy)
+    if line is None:
+        return
+    expires = strategy.pnl_baseline.cut_loss_min_hold_expires_at(strategy.position_opened_at)
+    assert expires is not None
+    LOG.info(
+        line,
+        extra={
+            "event": "cut_loss_min_hold",
+            "book": book,
+            "contract": contract,
+            "expires_hkt": format_hk_log_ts(expires),
+            "min_hold_hours": strategy.pnl_baseline.cut_loss_min_hold_hours,
+        },
+    )
+
+
+def _reentry_cooldown_line(strategy: MHImainStrategy) -> str | None:
+    bl = strategy.pnl_baseline
+    if not bl.locked or bl.cooldown_until is None:
+        return None
+    expires = bl.reentry_cooldown_expires_at()
+    assert expires is not None
+    return (
+        f"re-entry after {format_hk_log_ts(expires)} "
+        f"({bl.reentry_minimum_hours:.0f}h+{bl.reentry_move_pts:.0f}pt "
+        f"or {bl.reentry_trading_hours:.0f}h HKEX)"
+    )
+
+
+def _log_reentry_cooldown_expiry(
+    strategy: MHImainStrategy,
+    *,
+    book: str,
+    contract: str | None = None,
+) -> None:
+    line = _reentry_cooldown_line(strategy)
+    if line is None:
+        return
+    expires = strategy.pnl_baseline.reentry_cooldown_expires_at()
+    assert expires is not None
+    bl = strategy.pnl_baseline
+    LOG.info(
+        line,
+        extra={
+            "event": "reentry_cooldown",
+            "book": book,
+            "contract": contract,
+            "expires_hkt": format_hk_log_ts(expires),
+            "reentry_minimum_hours": bl.reentry_minimum_hours,
+            "reentry_move_pts": bl.reentry_move_pts,
+            "reentry_trading_hours": bl.reentry_trading_hours,
+        },
+    )
+
+
 def _position_snapshot_message(
     strategy: MHImainStrategy,
     position: UnitPositionBook,
@@ -1937,6 +2025,9 @@ def _position_snapshot_message(
     if position.contracts != 0:
         bl = strategy.pnl_baseline
         parts.append(f"cut {bl.cut_loss_trigger():+.0f} profit {bl.take_profit_trigger():+.0f}")
+        hold_line = _cut_loss_min_hold_line(strategy)
+        if hold_line is not None:
+            parts.append(hold_line)
     return " ".join(parts)
 
 
@@ -1947,10 +2038,15 @@ def _print_position_snapshot(
     live_price: float | None,
     *,
     title: str = "Position",
+    log_min_hold_expiry: bool = False,
+    book: str = "entry",
+    contract: str | None = None,
 ) -> None:
     del symbol
     msg = _position_snapshot_message(strategy, position, live_price, title=title)
     LOG.info(msg, extra={"event": "position_snapshot", "title": title, "contracts": position.contracts})
+    if log_min_hold_expiry and position.contracts != 0:
+        _log_cut_loss_min_hold_expiry(strategy, book=book, contract=contract)
 
 
 def _print_bootstrap(
@@ -2177,6 +2273,9 @@ def main() -> None:
                 portfolio.entry_position,
                 quote_price,
                 title=f"Startup {contract_log_label(front_contract)}",
+                log_min_hold_expiry=True,
+                book="entry",
+                contract=front_contract,
             )
         for leg in portfolio.ahead_of_front_legs():
             _print_position_snapshot(
@@ -2185,6 +2284,9 @@ def main() -> None:
                 leg.position,
                 prices.get(leg.code) if leg.code in prices else None,
                 title=f"Startup {contract_log_label(leg.code)} (next month)",
+                log_min_hold_expiry=True,
+                book="leg",
+                contract=leg.code,
             )
         if portfolio.is_flat():
             _, _, bootstrap_order = portfolio.flat_entry_target(front_contract)

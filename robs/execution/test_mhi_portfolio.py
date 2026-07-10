@@ -490,9 +490,9 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
                 23058.0,
             )
         self.assertTrue(mock_log.info.called)
-        msg = str(mock_log.info.call_args[0][0])
-        self.assertIn("MHI2607", msg)
-        self.assertIn("flat (0)", msg)
+        msgs = [str(c[0][0]) for c in mock_log.info.call_args_list]
+        snapshot = next(m for m in msgs if "MHI2607" in m)
+        self.assertIn("flat (0)", snapshot)
         self.assertIsNone(portfolio.leg_for_code("HK.MHI2607"))
 
     def test_report_leg_refresh_does_not_use_front_month_price(self) -> None:
@@ -531,10 +531,10 @@ class FlatEntryAfterAheadLegTests(unittest.TestCase):
                 23036.0,
                 broker_legs=[broker],
             )
-        msg = str(mock_log.info.call_args[0][0])
-        self.assertIn("MHI2607", msg)
-        self.assertIn("last 23010", msg)
-        self.assertNotIn("last 23036", msg)
+        msgs = [str(c[0][0]) for c in mock_log.info.call_args_list]
+        snapshot = next(m for m in msgs if "MHI2607" in m)
+        self.assertIn("last 23010", snapshot)
+        self.assertNotIn("last 23036", snapshot)
 
     def test_roll_day_entry_persists_after_roll_day(self) -> None:
         from robs.execution.risk import RiskManager

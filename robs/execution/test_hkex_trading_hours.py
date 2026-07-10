@@ -106,6 +106,16 @@ class HKEXTradingHoursTests(unittest.TestCase):
         nxt = next_hkex_mhi_session_open(mon)
         self.assertEqual(nxt, datetime(2026, 6, 29, 9, 15, tzinfo=HK))
 
+    def test_next_open_skips_public_holiday(self) -> None:
+        holiday = datetime(2026, 10, 1, 10, 0, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(holiday)
+        self.assertEqual(nxt, datetime(2026, 10, 2, 9, 15, tzinfo=HK))
+
+    def test_next_open_half_day_skips_afternoon_and_night(self) -> None:
+        lunch = datetime(2026, 12, 24, 12, 30, tzinfo=HK)
+        nxt = next_hkex_mhi_session_open(lunch)
+        self.assertEqual(nxt, datetime(2026, 12, 28, 9, 15, tzinfo=HK))
+
 
 if __name__ == "__main__":
     unittest.main()

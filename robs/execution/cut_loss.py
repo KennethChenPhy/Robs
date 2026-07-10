@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+
+from robs.execution.hkex_trading_hours import hkex_trading_hours_add, hkex_trading_hours_elapsed
 
 
 @dataclass
@@ -77,21 +79,36 @@ class PositionPnLBaseline:
         opened_at: datetime | None,
         now: datetime | None = None,
     ) -> tuple[bool, str]:
-        """Block cut loss until position has been held for cut_loss_min_hold_hours."""
+        """Block cut loss until HKEX trading hours (excl. weekends/holidays) reach min hold."""
         if opened_at is None:
             return False, ""
         now = now or datetime.now(timezone.utc)
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
-        elapsed_h = (now - opened_at).total_seconds() / 3600.0
+        elapsed_h = hkex_trading_hours_elapsed(opened_at, now)
         if elapsed_h >= self.cut_loss_min_hold_hours:
             return False, ""
         remaining_h = self.cut_loss_min_hold_hours - elapsed_h
         return (
             True,
-            f"min hold: no cut loss for {remaining_h:.1f}h more "
-            f"(need {self.cut_loss_min_hold_hours:.0f}h)",
+            f"min hold: no cut loss for {remaining_h:.1f} trading h more "
+            f"(need {self.cut_loss_min_hold_hours:.0f}h HKEX)",
         )
+
+    def cut_loss_min_hold_expires_at(
+        self,
+        opened_at: datetime | None,
+    ) -> datetime | None:
+        """HKT datetime when cut loss is allowed (after cut_loss_min_hold_hours of HKEX time)."""
+        if opened_at is None:
+            return None
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return hkex_trading_hours_add(opened_at, self.cut_loss_min_hold_hours)
+
+    def reentry_cooldown_expires_at(self) -> datetime | None:
+        """HKT datetime when re-entry is allowed via reentry_trading_hours alone."""
+        return self.cooldown_until
 
     def should_take_profit(self, entry_price: float, price: float, position: int) -> bool:
         if position == 0:
@@ -113,30 +130,30 @@ class PositionPnLBaseline:
         self.cooldown_until = None
 
     def record_exit_cooldown(self, exit_price: float) -> None:
-        """After exit: lock until (min hours AND move) OR trading hours elapse."""
+        """After exit: lock until (min HKEX hours AND move) OR reentry_trading_hours of HKEX time."""
         now = datetime.now(timezone.utc)
         self.locked = True
         self.cooldown_ref_price = exit_price
         self.cooldown_started_at = now
-        self.cooldown_until = now + timedelta(hours=self.reentry_trading_hours)
+        self.cooldown_until = hkex_trading_hours_add(now, self.reentry_trading_hours)
 
-    def _cooldown_hours_elapsed(self, now: datetime) -> float:
+    def _cooldown_trading_hours_elapsed(self, now: datetime) -> float:
         if self.cooldown_started_at is None:
             return 0.0
         started = self.cooldown_started_at
         if started.tzinfo is None:
             started = started.replace(tzinfo=timezone.utc)
-        return (now - started).total_seconds() / 3600.0
+        return hkex_trading_hours_elapsed(started, now)
 
     def record_cut_loss(self, exit_price: float) -> None:
         self.record_exit_cooldown(exit_price)
 
-    def blocks_entry(self, price: float) -> tuple[bool, str]:
+    def blocks_entry(self, price: float, now: datetime | None = None) -> tuple[bool, str]:
         if not self.locked or self.cooldown_ref_price is None:
             return False, ""
 
-        now = datetime.now(timezone.utc)
-        elapsed_h = self._cooldown_hours_elapsed(now)
+        now = now or datetime.now(timezone.utc)
+        elapsed_h = self._cooldown_trading_hours_elapsed(now)
         move = abs(price - self.cooldown_ref_price)
         ref = self.cooldown_ref_price
 
@@ -148,7 +165,7 @@ class PositionPnLBaseline:
 
         if trading_hours_ok:
             self._clear_cooldown()
-            return False, f"cooldown cleared after {self.reentry_trading_hours:.0f} trading hours"
+            return False, f"cooldown cleared after {self.reentry_trading_hours:.0f} HKEX trading hours"
 
         if min_hours_ok and move_ok:
             self._clear_cooldown()
@@ -158,17 +175,17 @@ class PositionPnLBaseline:
         if min_hours_left > 0:
             return (
                 True,
-                f"cooldown: {min_hours_left:.1f}h min wait before re-entry "
+                f"cooldown: {min_hours_left:.1f}h HKEX min wait before re-entry "
                 f"(move {move:.0f}/{self.reentry_move_pts:.0f}pt from {ref:.1f})",
             )
 
         need_pts = self.reentry_move_pts - move
         hours_left = 0.0
-        if self.cooldown_until is not None:
-            hours_left = max(0.0, (self.cooldown_until - now).total_seconds() / 3600.0)
+        if self.cooldown_until is not None and now < self.cooldown_until:
+            hours_left = hkex_trading_hours_elapsed(now, self.cooldown_until)
         return (
             True,
-            f"cooldown: need {need_pts:.0f}pt more or {hours_left:.1f}h left (from {ref:.1f})",
+            f"cooldown: need {need_pts:.0f}pt more or {hours_left:.1f}h HKEX left (from {ref:.1f})",
         )
 
 

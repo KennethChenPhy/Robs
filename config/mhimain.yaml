@@ -30,14 +30,14 @@ mhimain:
   # P/L exits from entry price (per contract): cut at -cut_loss_pts, profit at +take_profit_pts
   cut_loss_pts: 240         # close when P/L is launch − 200 pts
   take_profit_pts: 420      # close when P/L is launch + 400 pts
-  cut_loss_min_hold_hours: 36  # no cut loss until position held this long (take profit still allowed)
+  cut_loss_min_hold_hours: 24  # HKEX trading hours only (excl. weekends & HK public holidays)
 
   # Re-entry block after any exit; clears when:
-  #   (reentry_minimum_hours elapsed AND price moves reentry_move_pts from exit), OR
-  #   reentry_trading_hours elapse (wall-clock from exit)
+  #   (reentry_minimum_hours of HKEX time AND price moves reentry_move_pts from exit), OR
+  #   reentry_trading_hours of HKEX time elapse (excl. weekends & HK holidays)
   reentry_minimum_hours: 4
   reentry_move_pts: 400
-  reentry_trading_hours: 48
+  reentry_trading_hours: 34
 
   # Panic pause: block cut loss (not take profit) after a violent move
   panic_move_pts: 150
