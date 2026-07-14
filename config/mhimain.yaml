@@ -24,7 +24,7 @@ mhimain:
   #   uncertain  — price < MA5 → long; price > MA5 → short
   default_trend: uncertain
 
-  ma_period: 20              # daily MA length for uncertain entries
+  ma_period: 40              # daily MA length for uncertain entries
   ma_refresh_sec: 3600        # refresh daily MA before uncertain entry (min interval, 10 min)
 
   # P/L exits from entry price (per contract): cut at -cut_loss_pts, profit at +take_profit_pts
@@ -36,7 +36,7 @@ mhimain:
   #   (reentry_minimum_hours of HKEX time AND price moves reentry_move_pts from exit), OR
   #   reentry_trading_hours of HKEX time elapse (excl. weekends & HK holidays)
   reentry_minimum_hours: 4
-  reentry_move_pts: 400
+  reentry_move_pts: 420
   reentry_trading_hours: 34
 
   # Panic pause: block cut loss (not take profit) after a violent move

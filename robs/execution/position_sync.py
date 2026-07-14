@@ -421,6 +421,21 @@ def live_pnl_points(
     )
 
 
+def resolve_exit_price(
+    broker_price: float | None,
+    *,
+    last_price: float | None = None,
+    entry_price: float | None = None,
+) -> float:
+    """Prefer live/broker last, then explicit last quote; never prefer entry for cooldown."""
+    for px in (broker_price, last_price):
+        if px is not None and float(px) > 0:
+            return float(px)
+    if entry_price is not None and float(entry_price) > 0:
+        return float(entry_price)
+    return 0.0
+
+
 def refresh_broker_position(
     broker: BrokerPosition,
     position_book: Any,
@@ -429,6 +444,7 @@ def refresh_broker_position(
     *,
     cfg: dict | None = None,
     update_risk: bool = True,
+    last_price: float | None = None,
 ) -> bool:
     """Periodic broker sync: position state + min-hold / cooldown on manual open/close."""
     old_pos = position_book.contracts
@@ -445,10 +461,12 @@ def refresh_broker_position(
     if old_pos != 0 and (new_pos == 0 or sign_changed):
 
         def _handle_manual_close() -> None:
-            if entry_before is not None and px is not None:
+            exit_px = resolve_exit_price(
+                px, last_price=last_price, entry_price=entry_before
+            )
+            if entry_before is not None and exit_px > 0:
                 sign = 1 if old_pos > 0 else -1
-                strategy.pnl_baseline.realize_on_close(entry_before, px, sign)
-            exit_px = px if px is not None else (entry_before if entry_before is not None else 0.0)
+                strategy.pnl_baseline.realize_on_close(entry_before, exit_px, sign)
             strategy.on_broker_position_closed(exit_px)
 
         _handle_manual_close()

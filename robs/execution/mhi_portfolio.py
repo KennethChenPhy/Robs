@@ -404,16 +404,38 @@ class MHIPortfolio:
                 out.append(code)
         return out
 
+    def _last_price_for_code(
+        self,
+        code: str,
+        quote_prices: dict[str, float] | None,
+        fallback_price: float | None,
+    ) -> float | None:
+        if quote_prices:
+            if code in quote_prices:
+                return float(quote_prices[code])
+            for key, px in quote_prices.items():
+                if str(key).upper() == str(code).upper():
+                    return float(px)
+            if self.quote_symbol in quote_prices and not is_named_mhi_contract(code):
+                return float(quote_prices[self.quote_symbol])
+        if fallback_price is not None and float(fallback_price) > 0:
+            return float(fallback_price)
+        return None
+
     def _refresh_front_entry(
         self,
         by_code: dict[str, BrokerPosition],
         risk: Any,
+        *,
+        quote_prices: dict[str, float] | None = None,
+        fallback_price: float | None = None,
     ) -> list[BrokerPositionChange]:
         changed: list[BrokerPositionChange] = []
         matched = self._resolve_entry_matched(by_code)
         if matched is not None:
             self._drop_leg_if_any(matched)
             broker = by_code[matched]
+            last_px = self._last_price_for_code(matched, quote_prices, fallback_price)
             if refresh_broker_position(
                 broker,
                 self.entry_position,
@@ -421,6 +443,7 @@ class MHIPortfolio:
                 risk,
                 cfg=self.cfg,
                 update_risk=False,
+                last_price=last_px,
             ) and self._broker_contracts_reportable(matched, broker.contracts):
                 changed.append(
                     BrokerPositionChange(
@@ -441,12 +464,13 @@ class MHIPortfolio:
             self.entry_position.contracts != 0
             and self._broker_row_missing(entry_code, by_code)
         ):
+            last_px = self._last_price_for_code(entry_code, quote_prices, fallback_price)
             flat = BrokerPosition(
                 code=entry_code,
                 contracts=0,
                 qty=0,
                 entry_price=None,
-                current_price=None,
+                current_price=last_px,
                 pnl_points=0.0,
                 pnl_val=None,
             )
@@ -457,6 +481,7 @@ class MHIPortfolio:
                 risk,
                 cfg=self.cfg,
                 update_risk=False,
+                last_price=last_px,
             ):
                 self._note_broker_contracts(entry_code, 0)
                 changed.append(
@@ -470,23 +495,33 @@ class MHIPortfolio:
         code: str,
         by_code: dict[str, BrokerPosition],
         risk: Any,
+        *,
+        quote_prices: dict[str, float] | None = None,
+        fallback_price: float | None = None,
     ) -> BrokerPositionChange | None:
         leg = self.legs.get(code)
         if leg is None or leg.position.contracts == 0:
             return None
         if not self._broker_row_missing(code, by_code):
             return None
+        last_px = self._last_price_for_code(code, quote_prices, fallback_price)
         flat = BrokerPosition(
             code=code,
             contracts=0,
             qty=0,
             entry_price=None,
-            current_price=None,
+            current_price=last_px,
             pnl_points=0.0,
             pnl_val=None,
         )
         if not refresh_broker_position(
-            flat, leg.position, leg.strategy, risk, cfg=self.cfg, update_risk=False
+            flat,
+            leg.position,
+            leg.strategy,
+            risk,
+            cfg=self.cfg,
+            update_risk=False,
+            last_price=last_px,
         ):
             return None
         self._note_broker_contracts(code, 0)
@@ -496,6 +531,9 @@ class MHIPortfolio:
         self,
         broker_legs: list[BrokerPosition],
         risk: Any,
+        *,
+        quote_prices: dict[str, float] | None = None,
+        fallback_price: float | None = None,
     ) -> list[BrokerPositionChange]:
         """Sync entry book and manual month legs from broker positions."""
         by_code = {
@@ -503,7 +541,12 @@ class MHIPortfolio:
             for b in broker_legs
             if b.contracts != 0 and is_hk_mhi_product_code(b.code)
         }
-        changed = self._refresh_front_entry(by_code, risk)
+        changed = self._refresh_front_entry(
+            by_code,
+            risk,
+            quote_prices=quote_prices,
+            fallback_price=fallback_price,
+        )
         entry_code = self.entry_book_code_active()
 
         for code, broker in by_code.items():
@@ -512,8 +555,15 @@ class MHIPortfolio:
             if not is_named_mhi_contract(code):
                 continue
             leg = self.ensure_leg(code)
+            last_px = self._last_price_for_code(code, quote_prices, fallback_price)
             if refresh_broker_position(
-                broker, leg.position, leg.strategy, risk, cfg=self.cfg, update_risk=False
+                broker,
+                leg.position,
+                leg.strategy,
+                risk,
+                cfg=self.cfg,
+                update_risk=False,
+                last_price=last_px,
             ) and self._broker_contracts_reportable(code, broker.contracts):
                 changed.append(
                     BrokerPositionChange(code, "leg", leg.position.contracts),
@@ -522,7 +572,13 @@ class MHIPortfolio:
         for code in list(self.legs.keys()):
             if code in by_code:
                 continue
-            leg_change = self._sync_leg_flat_if_broker_gone(code, by_code, risk)
+            leg_change = self._sync_leg_flat_if_broker_gone(
+                code,
+                by_code,
+                risk,
+                quote_prices=quote_prices,
+                fallback_price=fallback_price,
+            )
             if leg_change is not None:
                 changed.append(leg_change)
 

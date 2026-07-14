@@ -1722,7 +1722,12 @@ def _refresh_broker_positions_if_due(
         return last_refresh_mono
     try:
         broker_legs = fetch_broker_mhi_legs(trade, symbol, cfg, quote_prices=prices)
-        changed_codes = portfolio.refresh_from_broker(broker_legs, risk)
+        changed_codes = portfolio.refresh_from_broker(
+            broker_legs,
+            risk,
+            quote_prices=prices,
+            fallback_price=fallback_price,
+        )
     except Exception as exc:
         LOG.warning(
             "broker position refresh failed",

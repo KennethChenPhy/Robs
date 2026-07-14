@@ -19,6 +19,7 @@ from robs.execution.position_sync import (
     fetch_broker_position,
     fetch_broker_position_for_code,
     refresh_broker_position,
+    resolve_exit_price,
     _broker_position_from_row,
     _pick_cost,
     _signed_contracts_from_row,
@@ -81,7 +82,25 @@ class PositionSyncTests(unittest.TestCase):
         self.assertTrue(strat.cooldown.locked)
         self.assertAlmostEqual(strat.cooldown.cooldown_ref_price or 0, 23400.0)
 
-    def test_manual_close_without_quote_still_cooldown(self) -> None:
+    def test_manual_close_without_quote_uses_last_price_not_entry(self) -> None:
+        pos = UnitPositionBook(contracts=-1)
+        strat = _strategy(entry_price=24301.0)
+        risk = _Risk()
+
+        broker = BrokerPosition(
+            code="HK.MHImain",
+            contracts=0,
+            qty=0,
+            entry_price=None,
+            current_price=None,
+            pnl_points=0.0,
+            pnl_val=None,
+        )
+        refresh_broker_position(broker, pos, strat, risk, last_price=24198.0)
+        self.assertTrue(strat.cooldown.locked)
+        self.assertEqual(strat.cooldown.cooldown_ref_price, 24198.0)
+
+    def test_manual_close_without_any_quote_falls_back_to_entry(self) -> None:
         pos = UnitPositionBook(contracts=1)
         strat = _strategy(entry_price=23500.0)
         risk = _Risk()
@@ -98,6 +117,49 @@ class PositionSyncTests(unittest.TestCase):
         refresh_broker_position(broker, pos, strat, risk)
         self.assertTrue(strat.cooldown.locked)
         self.assertEqual(strat.cooldown.cooldown_ref_price, 23500.0)
+
+    def test_jul14_manual_flat_cooldown_uses_last_not_entry(self) -> None:
+        """Regression: synthetic flat must not anchor cooldown on prior entry 24301."""
+        pos = UnitPositionBook(contracts=-1)
+        strat = _strategy(entry_price=24301.0)
+        strat.pnl_baseline.reentry_move_pts = 400
+        strat.pnl_baseline.reentry_minimum_hours = 4
+        strat.pnl_baseline.reentry_trading_hours = 34
+        risk = _Risk()
+        refresh_broker_position(
+            BrokerPosition(
+                code="HK.MHI2607",
+                contracts=0,
+                qty=0,
+                entry_price=None,
+                current_price=None,
+                pnl_points=0.0,
+                pnl_val=None,
+            ),
+            pos,
+            strat,
+            risk,
+            last_price=24198.0,
+        )
+        self.assertEqual(strat.cooldown.cooldown_ref_price, 24198.0)
+
+        started = datetime(2026, 7, 13, 23, 6, 23, tzinfo=ZoneInfo("Asia/Hong_Kong"))
+        strat.cooldown.cooldown_started_at = started
+        strat.cooldown.cooldown_until = hkex_trading_hours_add(started, 34)
+        blocked, reason = strat.cooldown.blocks_entry(
+            23898.0,
+            now=datetime(2026, 7, 14, 9, 45, 9, tzinfo=ZoneInfo("Asia/Hong_Kong")),
+        )
+        self.assertTrue(blocked)
+        self.assertIn("need", reason)
+        # Same price vs wrong entry ref would have cleared (403pt >= 400)
+        move_vs_entry = abs(23898.0 - 24301.0)
+        self.assertGreaterEqual(move_vs_entry, 400)
+
+    def test_resolve_exit_price_prefers_last_over_entry(self) -> None:
+        self.assertEqual(resolve_exit_price(None, last_price=24198.0, entry_price=24301.0), 24198.0)
+        self.assertEqual(resolve_exit_price(24200.0, last_price=24198.0, entry_price=24301.0), 24200.0)
+        self.assertEqual(resolve_exit_price(None, last_price=None, entry_price=24301.0), 24301.0)
 
     def test_flip_position_close_then_open(self) -> None:
         pos = UnitPositionBook(contracts=1)
