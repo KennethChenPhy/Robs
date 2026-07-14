@@ -69,6 +69,13 @@ mhimain:
   # Flat entries blocked 09:15–09:45 when |day open − prior night close| >= this (index pts)
   morning_gap_blackout_pts: 240
 
+# ntfy push (min-hold / re-entry datetimes). Topic from ~/.config/robs/watchdog.env
+# unless overridden here. Set enabled: false to silence trader alerts (watchdog independent).
+ntfy:
+  enabled: true
+  # topic:   # optional override of WATCHDOG_NTFY_TOPIC / NTFY_TOPIC
+  # server: https://ntfy.sh
+
 data:
   poll_interval_sec: 2      # seconds between quote polls
   poll_display_threshold_pts: 40  # only print status when price moves this many pts

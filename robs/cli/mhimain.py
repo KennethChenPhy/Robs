@@ -42,6 +42,7 @@ from robs.execution.hkex_trading_hours import (
 )
 from robs.execution.morning_gap_blackout import MorningGapBlackout
 from robs.execution.daily_ma_refresh import refresh_uncertain_daily_ma
+from robs.execution.ntfy_notify import configure_ntfy, notify_min_hold, notify_reentry
 from robs.execution.mhi_portfolio import (
     BrokerPositionChange,
     MHIPortfolio,
@@ -951,6 +952,7 @@ def _finalize_filled_order(
                 strategy,
                 book=book,
                 contract=trade_code,
+                contracts=position.contracts,
             )
 
 
@@ -1830,7 +1832,12 @@ def _report_broker_position_changes(
             },
         )
         if change.contracts != 0:
-            _log_cut_loss_min_hold_expiry(strategy, book=change.book, contract=code)
+            _log_cut_loss_min_hold_expiry(
+                strategy,
+                book=change.book,
+                contract=code,
+                contracts=change.contracts,
+            )
         elif strategy.pnl_baseline.locked:
             _log_reentry_cooldown_expiry(strategy, book=change.book, contract=code)
         if change.book == "leg" and change.contracts == 0:
@@ -1937,6 +1944,14 @@ def _position_label(contracts: int) -> str:
     return "flat (0)"
 
 
+def _side_label(contracts: int) -> str:
+    if contracts > 0:
+        return "long"
+    if contracts < 0:
+        return "short"
+    return "flat"
+
+
 def _cut_loss_min_hold_line(strategy: MHImainStrategy) -> str | None:
     if strategy.position_opened_at is None:
         return None
@@ -1955,21 +1970,29 @@ def _log_cut_loss_min_hold_expiry(
     *,
     book: str,
     contract: str | None = None,
+    contracts: int = 0,
 ) -> None:
     line = _cut_loss_min_hold_line(strategy)
     if line is None:
         return
     expires = strategy.pnl_baseline.cut_loss_min_hold_expires_at(strategy.position_opened_at)
     assert expires is not None
+    expires_hkt = format_hk_log_ts(expires)
     LOG.info(
         line,
         extra={
             "event": "cut_loss_min_hold",
             "book": book,
             "contract": contract,
-            "expires_hkt": format_hk_log_ts(expires),
+            "expires_hkt": expires_hkt,
             "min_hold_hours": strategy.pnl_baseline.cut_loss_min_hold_hours,
         },
+    )
+    notify_min_hold(
+        contract=contract_log_label(contract) if contract else None,
+        side=_side_label(contracts),
+        expires_hkt=expires_hkt,
+        min_hold_hours=strategy.pnl_baseline.cut_loss_min_hold_hours,
     )
 
 
@@ -1998,17 +2021,25 @@ def _log_reentry_cooldown_expiry(
     expires = strategy.pnl_baseline.reentry_cooldown_expires_at()
     assert expires is not None
     bl = strategy.pnl_baseline
+    expires_hkt = format_hk_log_ts(expires)
     LOG.info(
         line,
         extra={
             "event": "reentry_cooldown",
             "book": book,
             "contract": contract,
-            "expires_hkt": format_hk_log_ts(expires),
+            "expires_hkt": expires_hkt,
             "reentry_minimum_hours": bl.reentry_minimum_hours,
             "reentry_move_pts": bl.reentry_move_pts,
             "reentry_trading_hours": bl.reentry_trading_hours,
         },
+    )
+    notify_reentry(
+        contract=contract_log_label(contract) if contract else None,
+        expires_hkt=expires_hkt,
+        reentry_minimum_hours=bl.reentry_minimum_hours,
+        reentry_move_pts=bl.reentry_move_pts,
+        reentry_trading_hours=bl.reentry_trading_hours,
     )
 
 
@@ -2051,7 +2082,12 @@ def _print_position_snapshot(
     msg = _position_snapshot_message(strategy, position, live_price, title=title)
     LOG.info(msg, extra={"event": "position_snapshot", "title": title, "contracts": position.contracts})
     if log_min_hold_expiry and position.contracts != 0:
-        _log_cut_loss_min_hold_expiry(strategy, book=book, contract=contract)
+        _log_cut_loss_min_hold_expiry(
+            strategy,
+            book=book,
+            contract=contract,
+            contracts=position.contracts,
+        )
 
 
 def _print_bootstrap(
@@ -2163,6 +2199,7 @@ def main() -> None:
             "file logging enabled",
             extra={"event": "logging", "log_file": str(log_path)},
         )
+    configure_ntfy(cfg)
     mhi_cfg = cfg.get("mhimain", {})
     data_cfg = cfg.get("data", {})
     symbol = str(mhi_cfg.get("symbol", "HK.MHImain"))
