@@ -69,6 +69,10 @@ mhimain:
   # Flat entries blocked 09:15–09:45 when |day open − prior night close| >= this (index pts)
   morning_gap_blackout_pts: 240
 
+  # Entry lock: when true, bot does not open positions (manual assist mode).
+  # Cut loss, take profit, and forced flatten (kill switch / auth expiry) still run.
+  entry_lock: true
+
 # ntfy push (min-hold / re-entry datetimes). Topic from ~/.config/robs/watchdog.env
 # unless overridden here. Set enabled: false to silence trader alerts (watchdog independent).
 ntfy:

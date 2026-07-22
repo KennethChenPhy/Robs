@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from robs.config import load_config, trd_env_from_config, trd_env_name
+from robs.config import entry_lock_enabled, load_config, trd_env_from_config, trd_env_name
 from robs.data.futu_client import QuoteClient, TradeClient, endpoints_from_config
 from robs.execution.alarm import play_panic_alarm
 from robs.execution.contract_rollover import (
@@ -483,6 +483,9 @@ def _compact_poll_signal(status: str) -> str:
     if core.startswith("flat, waiting entry"):
         return f"wait entry{tags}"
 
+    if core.startswith("entry lock on"):
+        return f"entry lock{tags}"
+
     if core == "flat":
         return f"flat{tags}"
 
@@ -798,6 +801,22 @@ def _process_signal(
             else:
                 LOG.warning("order blocked: trade locked", extra={"event": "entry_blocked", "reason": "trade_locked"})
             return
+
+    if (
+        not force_flat
+        and entry_lock_enabled(cfg)
+        and is_new_entry(position.contracts, signal.action)
+    ):
+        LOG.warning(
+            "entry blocked: entry lock on (manual assist — exits only)",
+            extra={
+                "event": "entry_blocked",
+                "reason": "entry_lock",
+                "action": signal.action.value,
+                "order_code": trade_code,
+            },
+        )
+        return
 
     if (
         not force_flat
@@ -1138,6 +1157,8 @@ def _handle_contract_rollover(
         return True
 
     if rollover.state.phase == "idle":
+        if entry_lock_enabled(cfg):
+            return False
         if position.contracts == 0:
             return False
         held = held_contract or rollover.state.held_contract
@@ -1208,6 +1229,19 @@ def _handle_contract_rollover(
             return True
 
     if rollover.state.phase == "open":
+        if entry_lock_enabled(cfg):
+            target = rollover.state.target_contract
+            LOG.warning(
+                "contract rollover open skipped — entry lock on (manual assist)",
+                extra={
+                    "event": "contract_rollover",
+                    "phase": "open",
+                    "reason": "entry_lock",
+                    "target_contract": target,
+                },
+            )
+            rollover.reset()
+            return True
         if position.contracts != 0:
             opened = rollover.state.target_contract
             rollover.complete_if_opened(position.contracts)
@@ -2254,8 +2288,14 @@ def main() -> None:
             "panic_move_pts": mhi_cfg.get("panic_move_pts", 200),
             "panic_window_sec": mhi_cfg.get("panic_window_sec", 200),
             "panic_wait_min": mhi_cfg.get("panic_wait_min", 30),
+            "entry_lock": entry_lock_enabled(cfg),
         },
     )
+    if entry_lock_enabled(cfg):
+        LOG.info(
+            "entry lock on — manual assist mode (no auto entries; cut loss / take profit active)",
+            extra={"event": "entry_lock", "enabled": True},
+        )
 
     with QuoteClient(endpoints) as quote, TradeClient(endpoints, futures=True) as trade:
         ok, state = quote.global_state()
@@ -2347,6 +2387,7 @@ def main() -> None:
             _mhimain_session_active(cfg, gs_launch if ok_launch_gs else None)[0]
             and portfolio.is_flat()
             and not risk.killed
+            and not entry_lock_enabled(cfg)
             and quote_price is not None
         ):
             (

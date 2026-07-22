@@ -36,6 +36,7 @@ class MHImainStrategy:
     _order_pending: bool = False
     trend: TrendMode = TrendMode.UNCERTAIN
     morning_gap: MorningGapBlackout | None = None
+    entry_locked: bool = False
 
     @property
     def cooldown(self) -> PositionPnLBaseline:
@@ -51,6 +52,7 @@ class MHImainStrategy:
         reentry_minimum_hours = float(mhi.get("reentry_minimum_hours", 4))
         take_profit_pts = float(mhi.get("take_profit_pts", 400))
         cut_loss_min_hold_hours = float(mhi.get("cut_loss_min_hold_hours", 24))
+        entry_locked = bool(mhi.get("entry_lock", False))
         return cls(
             symbol=symbol,
             cut_loss_pts=cut_loss_pts,
@@ -71,6 +73,8 @@ class MHImainStrategy:
                 wait_min=float(mhi.get("panic_wait_min", 30)),
             ),
             trend=trend,
+            entry_locked=entry_locked,
+            _entry_armed=not entry_locked,
         )
 
     def set_ma5(self, ma5: float | None) -> None:
@@ -100,6 +104,8 @@ class MHImainStrategy:
         return self._entry_armed
 
     def rearm_entry_if_flat(self, position: UnitPositionBook) -> None:
+        if self.entry_locked:
+            return
         if position.contracts == 0 and not self.pnl_baseline.locked:
             self._entry_armed = True
 
@@ -150,6 +156,15 @@ class MHImainStrategy:
             )
 
         if position.contracts == 0:
+            if self.entry_locked:
+                return Signal(
+                    "mhimain",
+                    Action.HOLD,
+                    trade_ticker,
+                    "entry lock on — manual assist (exits only)",
+                    {"price": price},
+                )
+
             blocked, reason = self.pnl_baseline.blocks_entry(price)
             if blocked:
                 return Signal("mhimain", Action.HOLD, trade_ticker, reason, {"price": price})

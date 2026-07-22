@@ -63,3 +63,8 @@ def trd_env_from_config(cfg: dict[str, Any]):
 def is_paper_trading(cfg: dict[str, Any]) -> bool:
     """True when configured for Futu SIMULATE (paper) account."""
     return trd_env_name(cfg) != "REAL"
+
+
+def entry_lock_enabled(cfg: dict[str, Any]) -> bool:
+    """True when bot must not open positions (manual assist: exits only)."""
+    return bool(cfg.get("mhimain", {}).get("entry_lock", False))
